@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-adk-rust = { version = "1.0", features = ["cli", "ollama", "tools"] }
+adk-rust = { version = "1.0", features = ["cli", "openai", "tools"] }
 anyhow = "1.0.103"
 dotenvy = "0.15.7"
+matrix-sdk = "0.18.0"
 tokio = { version = "1", features = ["full"] }
