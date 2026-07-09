@@ -1,88 +1,68 @@
-use std::time::Duration;
+use anyhow::Context;
+use matrix_sdk::{
+    Client,
+    config::SyncSettings,
+};
 
-use matrix_sdk::{Client, Room, RoomState, config::SyncSettings, ruma::events::room::{member::StrippedRoomMemberEvent, message::{MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent}}, sleep::sleep};
+#[derive(Clone)]
+pub struct MatrixAgentConfig {
+    matrix_username: String,
+    matrix_password: String,
+    matrix_homeserver_url: String,
+}
 
-use crate::adk::call_ai;
+#[derive(Clone)]
+pub struct MatrixAgent {
+    config: MatrixAgentConfig,
+    pub client: Client,
+}
 
-// pub async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
-//     if room.state() != RoomState::Joined {
-//         return;
-//     }
-//     let MessageType::Text(text_content) = event.content.msgtype else {
-//         return;
-//     };
+impl MatrixAgentConfig {
+    pub fn default_from_env() -> Result<Self, anyhow::Error> {
+        let homeserver_url = std::env::var("MATRIX_HOMESERVER_URL")
+            .unwrap_or_else(|_| "https://matrix.org".to_string());
+        let username = std::env::var("MATRIX_USERNAME")
+            .context("No MATRIX_USERNAME given as env parameter")?;
+        let password = std::env::var("MATRIX_PASSWORD")
+            .context("No MATRIX_PASSWORD given as env parameter")?;
 
-//     if text_content.body.contains("!party") {
+        Ok(Self {
+            matrix_username: username,
+            matrix_password: password,
+            matrix_homeserver_url: homeserver_url,
+        })
+    }
+}
 
-//         let party_content = call_ai("Explain what a party is.".to_string()).await.unwrap();
+impl MatrixAgent {
+    pub async fn new(config: MatrixAgentConfig) -> Result<Self, anyhow::Error> {
+        let client = Client::builder()
+            .homeserver_url(&config.matrix_homeserver_url)
+            .build()
+            .await?;
+        Ok(Self {
+            config: config,
+            client: client,
+        })
+    }
 
-//         let content = RoomMessageEventContent::text_plain(party_content);
+    pub async fn connect_matrix(&self) -> Result<(), anyhow::Error> {
+        self.client
+            .matrix_auth()
+            .login_username(&self.config.matrix_username, &self.config.matrix_password)
+            .initial_device_display_name("autojoin bot")
+            .await?;
+        Ok(())
+    }
 
-//         println!("sending");
+    pub async fn sync(&self) -> Result<(), anyhow::Error> {
+        self.client
+            .sync(SyncSettings::default())
+            .await
+            .context("error syncing")
+    }
 
-//         // send our message to the room we found the "!party" command in
-//         room.send(content).await.unwrap();
-
-//         println!("message sent");
-//     }
-// }
-
-// pub async fn on_stripped_state_member(
-//     room_member: StrippedRoomMemberEvent,
-//     client: Client,
-//     room: Room,
-// ) {
-//     if room_member.state_key != client.user_id().unwrap() {
-//         return;
-//     }
-
-//     tokio::spawn(async move {
-//         println!("Autojoining room {}", room.room_id());
-//         let mut delay = 2;
-
-//         while let Err(err) = room.join().await {
-//             // retry autojoin due to synapse sending invites, before the
-//             // invited user can join for more information see
-//             // https://github.com/matrix-org/synapse/issues/4345
-//             eprintln!("Failed to join room {} ({err:?}), retrying in {delay}s", room.room_id());
-
-//             sleep(Duration::from_secs(delay)).await;
-//             delay *= 2;
-
-//             if delay > 3600 {
-//                 eprintln!("Can't join room {} ({err:?})", room.room_id());
-//                 break;
-//             }
-//         }
-//         if delay <= 3600 {
-//             println!("Successfully joined room {}", room.room_id());
-//             client.add_event_handler(on_room_message);
-//             let banana_desc = call_ai("Explain what a banana is.".to_string()).await.unwrap();
-//             println!("AI response: {}", banana_desc);
-//             let message = RoomMessageEventContent::text_plain(banana_desc);
-//             room.send(message).await.unwrap();
-//         }
-//     });
-// }
-
-// pub async fn login_and_sync() -> anyhow::Result<()> {
-    
-//     // Note that when encryption is enabled, you should use a persistent store to be
-//     // able to restore the session with a working encryption setup.
-//     // See the `persist_session` example.
-//     let client = Client::builder().homeserver_url(homeserver_url).build().await?;
-
-//     client
-//         .matrix_auth()
-//         .login_username(&username, &password)
-//         .initial_device_display_name("autojoin bot")
-//         .await?;
-
-//     println!("logged in as {username}");
-
-//     client.add_event_handler(on_stripped_state_member);
-
-//     client.sync(SyncSettings::default()).await?;
-
-//     Ok(())
-// }
+    pub fn client(&self) -> Client {
+        self.client.clone()
+    }
+}
