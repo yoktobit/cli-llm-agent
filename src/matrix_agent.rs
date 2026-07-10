@@ -1,8 +1,10 @@
 use std::{sync::Arc, time::Duration};
 
+use matrix_sdk::ruma::events::Mentions;
 use matrix_sdk::ruma::events::SyncMessageLikeEvent;
 use matrix_sdk::ruma::events::room::member::StrippedRoomMemberEvent;
 use matrix_sdk::ruma::events::room::message::{MessageType, RoomMessageEventContent};
+use matrix_sdk::ruma::{OwnedUserId, UserId};
 use matrix_sdk::{Client, Room, RoomState};
 
 use crate::adk::AdkOpenAiAgent;
@@ -156,6 +158,14 @@ impl MatrixAdkAgent {
                     return;
                 };
 
+                let message_body = text_content.body.clone();
+                if let Some(introduction) = Self::extract_introduction(&message_body) {
+                    let sender = event.sender.to_string();
+                    self.adk_agent
+                        .remember_introduction(sender.clone(), introduction.clone());
+                    println!("Stored introduction from {sender}: {introduction}");
+                }
+
                 let mentioned = event.content.mentions.iter().any(|mention| {
                     if mention.room {
                         return true;
@@ -170,7 +180,7 @@ impl MatrixAdkAgent {
                     return;
                 }
                 
-                let question = text_content.body;
+                let question = message_body;
                 println!("got message and was mentioned, asking llm: {question}");
                 if let Err(_) = room.typing_notice(true).await {}
                 let result_content = self
@@ -183,7 +193,14 @@ impl MatrixAdkAgent {
                 if let Err(_) = room.typing_notice(false).await {}
                 
                 if !result_content.trim().is_empty() {
-                    let content = RoomMessageEventContent::text_plain(result_content);
+                    let (outgoing_text, helper_names) = Self::extract_helper_tags(&result_content);
+                    let mentioned_user_ids = self.resolve_user_mentions(&helper_names);
+
+                    let mut content = RoomMessageEventContent::text_plain(outgoing_text);
+                    if !mentioned_user_ids.is_empty() {
+                        content = content.add_mentions(Mentions::with_user_ids(mentioned_user_ids));
+                    }
+
                     println!("sending");
                     room.send(content).await.unwrap();
                     println!("message sent");
@@ -192,5 +209,68 @@ impl MatrixAdkAgent {
             }
             SyncMessageLikeEvent::Redacted(_redacted) => {}
         }
+    }
+
+    fn extract_introduction(message: &str) -> Option<String> {
+        let trimmed = message.trim_start();
+        let introduction = trimmed
+            .strip_prefix("[Introduction]")
+            .or_else(|| trimmed.strip_prefix("[introduction]"))?
+            .trim_start_matches(':')
+            .trim();
+
+        if introduction.is_empty() {
+            return None;
+        }
+
+        Some(introduction.to_string())
+    }
+
+    fn extract_helper_tags(message: &str) -> (String, Vec<String>) {
+        let mut cleaned = String::with_capacity(message.len());
+        let mut helper_names = Vec::new();
+        let mut remaining = message;
+
+        while let Some(start) = remaining.find("@[") {
+            cleaned.push_str(&remaining[..start]);
+
+            let after_start = &remaining[start + 2..];
+            let Some(end) = after_start.find(']') else {
+                cleaned.push_str("@[");
+                cleaned.push_str(after_start);
+                return (cleaned, helper_names);
+            };
+
+            let helper_name = after_start[..end].trim();
+            if !helper_name.is_empty() {
+                helper_names.push(helper_name.to_string());
+                cleaned.push('@');
+                cleaned.push_str(helper_name);
+            }
+
+            remaining = &after_start[end + 1..];
+        }
+
+        cleaned.push_str(remaining);
+        (cleaned, helper_names)
+    }
+
+    fn resolve_user_mentions(&self, helper_names: &[String]) -> Vec<OwnedUserId> {
+        let mut user_ids = Vec::new();
+
+        for helper_name in helper_names {
+            for user_id in self.adk_agent.find_helper_user_ids_by_name(helper_name) {
+                match UserId::parse(user_id.clone()) {
+                    Ok(owned) => user_ids.push(owned),
+                    Err(_) => {
+                        eprintln!("Skipping invalid helper user id '{user_id}' for '{helper_name}'");
+                    }
+                }
+            }
+        }
+
+        user_ids.sort();
+        user_ids.dedup();
+        user_ids
     }
 }

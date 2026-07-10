@@ -8,7 +8,11 @@ use adk_rust::{
 };
 
 use anyhow::{Context, Result};
-use std::{collections::HashMap, sync::atomic::{AtomicBool, Ordering}, sync::{Arc, Mutex}};
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicBool, Ordering},
+    sync::{Arc, Mutex},
+};
 
 #[derive(Clone)]
 pub struct AdkOpenAiAgentConfig {
@@ -23,6 +27,7 @@ pub struct AdkOpenAiAgentConfig {
 pub struct AdkOpenAiAgent {
     config: AdkOpenAiAgentConfig,
     client: Arc<OpenAIResponsesClient>,
+    introductions: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl AdkOpenAiAgentConfig {
@@ -65,7 +70,37 @@ impl AdkOpenAiAgent {
         Ok(Self {
             config: config,
             client: Arc::new(client),
+            introductions: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    pub fn remember_introduction(&self, name: String, introduction: String) {
+        if let Ok(mut introductions) = self.introductions.lock() {
+            introductions.insert(name, introduction);
+        }
+    }
+
+    pub fn find_helper_user_ids_by_name(&self, name: &str) -> Vec<String> {
+        let requested = name.trim().to_lowercase();
+        if requested.is_empty() {
+            return Vec::new();
+        }
+
+        let Ok(introductions) = self.introductions.lock() else {
+            return Vec::new();
+        };
+
+        let mut matches: Vec<String> = introductions
+            .keys()
+            .filter(|known_name| {
+                let known = known_name.to_lowercase();
+                known == requested || known.contains(&requested)
+            })
+            .cloned()
+            .collect();
+        matches.sort();
+        matches.dedup();
+        matches
     }
 
     pub fn introduction(&self) -> String {
@@ -77,17 +112,85 @@ impl AdkOpenAiAgent {
     }
 
     pub async fn ask(self: &Arc<Self>, message: String) -> Result<String, anyhow::Error> {
-        let system_prompt = self.config.system_prompt.clone().unwrap_or( 
+        let mut system_prompt = self.config.system_prompt.clone().unwrap_or( 
             "You are a helpful assistant. If you are asked to introduce yourself, use the introduction tool and return only its result, nothing more.".to_string()
         );
+
+        system_prompt.push_str("\n\nIf you are asked to introduce yourself, use the introduction tool and return only its result, nothing more.");
+        system_prompt.push_str("\n\nIf there is another agent which may solve a task better than you, because of it's description, please ask him by writing @[Agent-Name] (including the eckige klammern) ");
+        system_prompt.push_str("\n\nUse the get_known_introductions tool when you need to decide which known helper should assist with a task.");
 
         let introduction = self.introduction();
         let introduction_tool = Arc::new(FunctionTool::new(
             "introduce_yourself",
             "Return the configured self-introduction string.",
             move |_ctx, _args| {
-                let introduction = introduction.clone();
+                let introduction = format!("[Introduction]: {}", introduction.clone());
                 async move { Ok(json!(introduction)) }
+            },
+        ));
+
+        let introductions = Arc::clone(&self.introductions);
+        let known_introductions_tool = Arc::new(FunctionTool::new(
+            "get_known_introductions",
+            "Return all known introductions. Optional arg 'name' filters by helper name (supports case-insensitive partial match).",
+            move |_ctx, args| {
+                let introductions = Arc::clone(&introductions);
+                async move {
+                    let requested_name = args
+                        .get("name")
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                        .map(ToOwned::to_owned);
+
+                    let introductions = match introductions.lock() {
+                        Ok(introductions) => introductions,
+                        Err(_) => {
+                            return Ok(json!({
+                                "requested_name": requested_name,
+                                "matches": [],
+                                "all": [],
+                                "error": "failed to read introductions registry"
+                            }));
+                        }
+                    };
+
+                    let mut all_entries: Vec<(String, String)> = introductions
+                        .iter()
+                        .map(|(name, intro)| (name.clone(), intro.clone()))
+                        .collect();
+                    all_entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+                    let all_json: Vec<_> = all_entries
+                        .iter()
+                        .map(|(name, introduction)| {
+                            json!({"name": name, "introduction": introduction})
+                        })
+                        .collect();
+
+                    if let Some(requested_name) = requested_name {
+                        let requested_lower = requested_name.to_lowercase();
+                        let matches_json: Vec<_> = all_entries
+                            .iter()
+                            .filter(|(name, _)| {
+                                name.to_lowercase() == requested_lower
+                                    || name.to_lowercase().contains(&requested_lower)
+                            })
+                            .map(|(name, introduction)| {
+                                json!({"name": name, "introduction": introduction})
+                            })
+                            .collect();
+
+                        return Ok(json!({
+                            "requested_name": requested_name,
+                            "matches": matches_json,
+                            "all": all_json,
+                        }));
+                    }
+
+                    Ok(json!({ "all": all_json }))
+                }
             },
         ));
 
@@ -97,6 +200,7 @@ impl AdkOpenAiAgent {
                 .model(self.client.clone())
                 .instruction(system_prompt)
                 .tool(introduction_tool)
+                .tool(known_introductions_tool)
                 .build()?,
         );
 
