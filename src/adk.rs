@@ -56,6 +56,8 @@ impl AdkOpenAiAgent {
         let ai_config =
             OpenAIResponsesConfig::new(&config.openai_api_key, &config.open_responses_model)
                 .with_open_responses_mode(true)
+                .with_reasoning_effort(adk_rust::model::ReasoningEffort::Low)
+                .with_reasoning_summary(adk_rust::model::openai::ReasoningSummary::Concise)
                 .with_base_url(&config.open_responses_base_url);
 
         let client = OpenAIResponsesClient::new(ai_config)?;

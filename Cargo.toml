@@ -4,8 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-adk-rust = { version = "1.0", features = ["cli", "openai", "tools"] }
+adk-rust = { features = ["cli", "openai", "tools"], path = "../adk-rust/adk-rust" }
 anyhow = "1.0.103"
 dotenvy = "0.15.7"
 matrix-sdk = "0.18.0"
 tokio = { version = "1", features = ["full"] }
+async-openai = "0.41.1"
+
+[patch.crates-io]
+adk-rust = { path = "../adk-rust/adk-rust" }
+adk-model = { path = "../adk-rust/adk-model" }
+async-openai = { path = "../async-openai/async-openai" }

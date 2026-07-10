@@ -166,24 +166,29 @@ impl MatrixAdkAgent {
                         .any(|mention| mention == self.matrix_agent.client().user_id().unwrap())
                 });
                 if !mentioned {
+                    println!("got message, but not mentioned");
                     return;
                 }
-
+                
                 let question = text_content.body;
-                let party_content = self
+                println!("got message and was mentioned, asking llm: {question}");
+                if let Err(_) = room.typing_notice(true).await {}
+                let result_content = self
                     .adk_agent
                     .ask(question)
                     .await
                     .unwrap();
+                println!("Result: {result_content}");
+                
+                if let Err(_) = room.typing_notice(false).await {}
+                
+                if !result_content.trim().is_empty() {
+                    let content = RoomMessageEventContent::text_plain(result_content);
+                    println!("sending");
+                    room.send(content).await.unwrap();
+                    println!("message sent");
+                }
 
-                let content = RoomMessageEventContent::text_plain(party_content);
-
-                println!("sending");
-
-                // send our message to the room we found the "!party" command in
-                room.send(content).await.unwrap();
-
-                println!("message sent");
             }
             SyncMessageLikeEvent::Redacted(_redacted) => {}
         }
