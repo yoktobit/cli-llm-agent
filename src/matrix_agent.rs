@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{sync::Arc, sync::atomic::{AtomicU64, Ordering}, time::Duration};
 
 use matrix_sdk::ruma::events::Mentions;
 use matrix_sdk::ruma::events::SyncMessageLikeEvent;
@@ -15,6 +15,7 @@ pub struct MatrixAdkAgent {
     matrix_agent: Arc<MatrixAgent>,
     adk_agent: Arc<AdkOpenAiAgent>,
     auto_join: bool,
+    task_counter: Arc<AtomicU64>,
     // TODO: Weitere Handler erlauben
     // join_handlers: Vec<JoinHandler>,
     // message_handlers: Vec<MessageHandler>,
@@ -32,6 +33,7 @@ impl MatrixAdkAgent {
             matrix_agent: Arc::new(matrix_agent),
             adk_agent: Arc::new(adk_agent),
             auto_join: auto_join,
+            task_counter: Arc::new(AtomicU64::new(1)),
             // join_handlers: join_handlers,
             // message_handlers: message_handlers,
         };
@@ -179,8 +181,9 @@ impl MatrixAdkAgent {
                     println!("got message, but not mentioned");
                     return;
                 }
-                
-                let question = message_body;
+
+                let task_context = self.build_task_context(&event.sender.to_string(), room.room_id().to_string(), &message_body);
+                let question = task_context.to_prompt();
                 println!("got message and was mentioned, asking llm: {question}");
                 if let Err(_) = room.typing_notice(true).await {}
                 let result_content = self
@@ -191,10 +194,11 @@ impl MatrixAdkAgent {
                 println!("Result: {result_content}");
                 
                 if let Err(_) = room.typing_notice(false).await {}
-                
+
                 if !result_content.trim().is_empty() {
-                    let (outgoing_text, helper_names) = Self::extract_helper_tags(&result_content);
-                    let mentioned_user_ids = self.resolve_user_mentions(&helper_names);
+                    let response = Self::parse_agent_response(&result_content);
+                    let mentioned_user_ids = self.resolve_mentions(&response, &task_context);
+                    let outgoing_text = self.compose_outgoing_message(response, &task_context);
 
                     let mut content = RoomMessageEventContent::text_plain(outgoing_text);
                     if !mentioned_user_ids.is_empty() {
@@ -255,6 +259,120 @@ impl MatrixAdkAgent {
         (cleaned, helper_names)
     }
 
+    fn build_task_context(&self, sender: &str, room_id: String, message: &str) -> TaskContext {
+        let parsed = TaskMetadata::parse(message);
+        let task_id = parsed
+            .task_id
+            .unwrap_or_else(|| self.next_task_id());
+        let requester = parsed
+            .requester
+            .unwrap_or_else(|| sender.to_string());
+
+        TaskContext {
+            task_id,
+            requester,
+            sender: sender.to_string(),
+            room_id,
+            original_message: parsed.body,
+            has_existing_task_id: parsed.had_task_id,
+        }
+    }
+
+    fn next_task_id(&self) -> String {
+        let task_number = self.task_counter.fetch_add(1, Ordering::Relaxed);
+        format!("task-{task_number}")
+    }
+
+    fn parse_agent_response(message: &str) -> AgentResponse {
+        let completion_task_id = Self::extract_marker_value(message, "[TaskComplete:", ']');
+        let requester = Self::extract_marker_value(message, "[Requester:", ']');
+        let task_id = Self::extract_marker_value(message, "[Task:", ']');
+        let without_internal_markers = Self::strip_marker(message, "[TaskComplete:");
+        let without_requester_marker = Self::strip_marker(&without_internal_markers, "[Requester:");
+        let without_task_marker = Self::strip_marker(&without_requester_marker, "[Task:");
+        let (text, helper_names) = Self::extract_helper_tags(&without_task_marker);
+
+        AgentResponse {
+            text: text.trim().to_string(),
+            helper_names,
+            task_id,
+            completion_task_id,
+            requester,
+        }
+    }
+
+    fn compose_outgoing_message(&self, response: AgentResponse, task_context: &TaskContext) -> String {
+        let is_completion = response.is_completion();
+        let mut text = response.text;
+        let effective_task_id = response
+            .task_id
+            .clone()
+            .or(response.completion_task_id.clone())
+            .unwrap_or_else(|| task_context.task_id.clone());
+        let should_prefix_task = !response.helper_names.is_empty()
+            || response.completion_task_id.is_some()
+            || task_context.has_existing_task_id;
+
+        if should_prefix_task {
+            text = format!("[Task: {effective_task_id}] {text}").trim().to_string();
+        }
+
+        if text.is_empty() && is_completion {
+            text = format!("[Task: {effective_task_id}]");
+        }
+
+        text
+    }
+
+    fn resolve_mentions(&self, response: &AgentResponse, task_context: &TaskContext) -> Vec<OwnedUserId> {
+        let mut user_ids = self.resolve_user_mentions(&response.helper_names);
+
+        if response.is_completion() {
+            let requester = response
+                .requester
+                .as_deref()
+                .unwrap_or(&task_context.requester);
+            if let Ok(user_id) = UserId::parse(requester) {
+                user_ids.push(user_id);
+            } else {
+                eprintln!("Skipping invalid requester user id '{requester}'");
+            }
+        }
+
+        user_ids.sort();
+        user_ids.dedup();
+        user_ids
+    }
+
+    fn extract_marker_value(message: &str, prefix: &str, suffix: char) -> Option<String> {
+        let start = message.find(prefix)?;
+        let after_prefix = &message[start + prefix.len()..];
+        let end = after_prefix.find(suffix)?;
+        let value = after_prefix[..end].trim();
+        if value.is_empty() {
+            return None;
+        }
+        Some(value.to_string())
+    }
+
+    fn strip_marker(message: &str, prefix: &str) -> String {
+        let mut stripped = String::with_capacity(message.len());
+        let mut remaining = message;
+
+        while let Some(start) = remaining.find(prefix) {
+            stripped.push_str(&remaining[..start]);
+            let after_prefix = &remaining[start + prefix.len()..];
+            let Some(end) = after_prefix.find(']') else {
+                stripped.push_str(&remaining[start..]);
+                return stripped;
+            };
+            remaining = &after_prefix[end + 1..];
+        }
+
+        stripped.push_str(remaining);
+        stripped
+    }
+
     fn resolve_user_mentions(&self, helper_names: &[String]) -> Vec<OwnedUserId> {
         let mut user_ids = Vec::new();
 
@@ -272,5 +390,62 @@ impl MatrixAdkAgent {
         user_ids.sort();
         user_ids.dedup();
         user_ids
+    }
+}
+
+struct TaskMetadata {
+    task_id: Option<String>,
+    requester: Option<String>,
+    body: String,
+    had_task_id: bool,
+}
+
+impl TaskMetadata {
+    fn parse(message: &str) -> Self {
+        let task_id = MatrixAdkAgent::extract_marker_value(message, "[Task:", ']');
+        let requester = MatrixAdkAgent::extract_marker_value(message, "[Requester:", ']');
+        let without_requester = MatrixAdkAgent::strip_marker(message, "[Requester:");
+        let body = MatrixAdkAgent::strip_marker(&without_requester, "[Task:")
+            .trim()
+            .to_string();
+
+        Self {
+            had_task_id: task_id.is_some(),
+            task_id,
+            requester,
+            body,
+        }
+    }
+}
+
+struct TaskContext {
+    task_id: String,
+    requester: String,
+    sender: String,
+    room_id: String,
+    original_message: String,
+    has_existing_task_id: bool,
+}
+
+impl TaskContext {
+    fn to_prompt(&self) -> String {
+        format!(
+            "[TaskContext]\ntask_id: {}\nrequester: {}\nsender: {}\nroom_id: {}\noriginal_message:\n{}",
+            self.task_id, self.requester, self.sender, self.room_id, self.original_message
+        )
+    }
+}
+
+struct AgentResponse {
+    text: String,
+    helper_names: Vec<String>,
+    task_id: Option<String>,
+    completion_task_id: Option<String>,
+    requester: Option<String>,
+}
+
+impl AgentResponse {
+    fn is_completion(&self) -> bool {
+        self.completion_task_id.is_some() || (self.helper_names.is_empty() && !self.text.is_empty())
     }
 }

@@ -10,14 +10,20 @@ use adk_rust::{
 use anyhow::{Context, Result};
 use std::{
     collections::HashMap,
+    fs,
+    path::PathBuf,
     sync::atomic::{AtomicBool, Ordering},
     sync::{Arc, Mutex},
 };
+
+const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful assistant.";
+const COLLABORATION_PROTOCOL: &str = "When you receive a chat message, first inspect the known participant introductions with the get_known_introductions tool before deciding whether to answer yourself or collaborate. Use those introductions to judge who is best suited for the task.\n\nIf you are asked to introduce yourself, use the introduce_yourself tool and return only its result, nothing more.\n\nYou may receive a task context block containing task_id, requester, sender, room_id, and the original message. Keep the task_id stable across all collaboration messages.\n\nIf another participant is better suited or collaboration is needed, respond with a message that includes `[Task: <task_id>]` and mention collaborators as `@[Agent-Name]`.\n\nIf you complete the task yourself, include `[TaskComplete: <task_id>]` in your reply. When a requester is provided in the context, also include `[Requester: <requester_user_id>]`.\n\nDo not invent collaborators. Base delegation decisions on known introductions.";
 
 #[derive(Clone)]
 pub struct AdkOpenAiAgentConfig {
     introduction: Option<String>,
     system_prompt: Option<String>,
+    introductions_file: PathBuf,
     open_responses_model: String,
     open_responses_base_url: String,
     openai_api_key: String,
@@ -38,9 +44,13 @@ impl AdkOpenAiAgentConfig {
             .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
         let model =
             std::env::var("OPEN_RESPONSES_MODEL").unwrap_or_else(|_| "gpt-4.1-nano".to_string());
+        let introductions_file = std::env::var("INTRODUCTIONS_FILE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(".matrix-store/introductions.json"));
         Ok(Self {
             introduction: None,
             system_prompt: None,
+            introductions_file,
             open_responses_model: model,
             open_responses_base_url: base_url,
             openai_api_key: api_key,
@@ -58,6 +68,15 @@ impl AdkOpenAiAgentConfig {
 
 impl AdkOpenAiAgent {
     pub async fn new(config: AdkOpenAiAgentConfig) -> Result<Self, anyhow::Error> {
+        if let Some(parent) = config.introductions_file.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed to create introductions dir {}",
+                    parent.display()
+                )
+            })?;
+        }
+
         let ai_config =
             OpenAIResponsesConfig::new(&config.openai_api_key, &config.open_responses_model)
                 .with_open_responses_mode(true)
@@ -66,17 +85,27 @@ impl AdkOpenAiAgent {
                 .with_base_url(&config.open_responses_base_url);
 
         let client = OpenAIResponsesClient::new(ai_config)?;
+        let introductions = Self::load_introductions(&config.introductions_file)?;
 
         Ok(Self {
             config: config,
             client: Arc::new(client),
-            introductions: Arc::new(Mutex::new(HashMap::new())),
+            introductions: Arc::new(Mutex::new(introductions)),
         })
     }
 
     pub fn remember_introduction(&self, name: String, introduction: String) {
         if let Ok(mut introductions) = self.introductions.lock() {
             introductions.insert(name, introduction);
+            if let Err(err) = Self::persist_introductions(
+                &self.config.introductions_file,
+                &introductions,
+            ) {
+                eprintln!(
+                    "Failed to persist introductions to {}: {err}",
+                    self.config.introductions_file.display()
+                );
+            }
         }
     }
 
@@ -112,13 +141,14 @@ impl AdkOpenAiAgent {
     }
 
     pub async fn ask(self: &Arc<Self>, message: String) -> Result<String, anyhow::Error> {
-        let mut system_prompt = self.config.system_prompt.clone().unwrap_or( 
-            "You are a helpful assistant. If you are asked to introduce yourself, use the introduction tool and return only its result, nothing more.".to_string()
-        );
+        let mut system_prompt = self
+            .config
+            .system_prompt
+            .clone()
+            .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
 
-        system_prompt.push_str("\n\nIf you are asked to introduce yourself, use the introduction tool and return only its result, nothing more.");
-        system_prompt.push_str("\n\nIf there is another agent which may solve a task better than you, because of it's description, please ask him by writing @[Agent-Name] (including the eckige klammern) ");
-        system_prompt.push_str("\n\nUse the get_known_introductions tool when you need to decide which known helper should assist with a task.");
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str(COLLABORATION_PROTOCOL);
 
         let introduction = self.introduction();
         let introduction_tool = Arc::new(FunctionTool::new(
@@ -242,6 +272,32 @@ impl AdkOpenAiAgent {
             println!();
         }
         Ok(response_text)
+    }
+
+    fn load_introductions(path: &PathBuf) -> Result<HashMap<String, String>, anyhow::Error> {
+        let serialized = match fs::read(path) {
+            Ok(contents) => contents,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("failed to read introductions file {}", path.display())
+                });
+            }
+        };
+
+        serde_json::from_slice(&serialized).with_context(|| {
+            format!("failed to parse introductions file {}", path.display())
+        })
+    }
+
+    fn persist_introductions(
+        path: &PathBuf,
+        introductions: &HashMap<String, String>,
+    ) -> Result<(), anyhow::Error> {
+        let serialized = serde_json::to_vec_pretty(introductions)
+            .context("failed to serialize known introductions")?;
+        fs::write(path, serialized)
+            .with_context(|| format!("failed to write introductions file {}", path.display()))
     }
 }
 
