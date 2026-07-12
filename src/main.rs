@@ -20,11 +20,11 @@
 
 use std::sync::Arc;
 
-use crate::{adk::{AdkOpenAiAgent, AdkOpenAiAgentConfig}, matrix::{MatrixAgent, MatrixAgentConfig}, matrix_agent::MatrixAdkAgent};
+use crate::{adk::{AdkOpenAiAgent, AdkOpenAiAgentConfig}, matrix::{MatrixAgent, MatrixAgentConfig}, matrix_adk_agent::MatrixAdkAgent};
 
 pub mod adk;
 pub mod matrix;
-pub mod matrix_agent;
+pub mod matrix_adk_agent;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

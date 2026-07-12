@@ -347,7 +347,7 @@ impl Session for SimpleSession {
     }
 
     fn app_name(&self) -> &str {
-        "cli-llm-agent"
+        "matrix-adk-agent-rs"
     }
 
     fn user_id(&self) -> &str {

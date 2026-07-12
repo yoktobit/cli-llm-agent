@@ -1,4 +1,4 @@
-use std::{sync::Arc, sync::atomic::{AtomicU64, Ordering}, time::Duration};
+use std::{collections::HashSet, sync::Arc, sync::atomic::{AtomicU64, Ordering}, time::Duration};
 
 use matrix_sdk::ruma::events::Mentions;
 use matrix_sdk::ruma::events::SyncMessageLikeEvent;
@@ -197,10 +197,20 @@ impl MatrixAdkAgent {
 
                 if !result_content.trim().is_empty() {
                     let response = Self::parse_agent_response(&result_content);
-                    let mentioned_user_ids = self.resolve_mentions(&response, &task_context);
+                    let mention_targets = self.resolve_mentions(&response, &task_context, &room).await;
                     let outgoing_text = self.compose_outgoing_message(response, &task_context);
+                    let (outgoing_text, outgoing_html) =
+                        Self::attach_visible_mentions(outgoing_text, &mention_targets);
+                    let mentioned_user_ids = mention_targets
+                        .iter()
+                        .map(|target| target.user_id.clone())
+                        .collect::<Vec<_>>();
 
-                    let mut content = RoomMessageEventContent::text_plain(outgoing_text);
+                    let mut content = if let Some(html) = outgoing_html {
+                        RoomMessageEventContent::text_html(outgoing_text, html)
+                    } else {
+                        RoomMessageEventContent::text_plain(outgoing_text)
+                    };
                     if !mentioned_user_ids.is_empty() {
                         content = content.add_mentions(Mentions::with_user_ids(mentioned_user_ids));
                     }
@@ -230,33 +240,25 @@ impl MatrixAdkAgent {
         Some(introduction.to_string())
     }
 
-    fn extract_helper_tags(message: &str) -> (String, Vec<String>) {
-        let mut cleaned = String::with_capacity(message.len());
+    fn extract_helper_tags(message: &str) -> Vec<String> {
         let mut helper_names = Vec::new();
         let mut remaining = message;
 
         while let Some(start) = remaining.find("@[") {
-            cleaned.push_str(&remaining[..start]);
-
             let after_start = &remaining[start + 2..];
             let Some(end) = after_start.find(']') else {
-                cleaned.push_str("@[");
-                cleaned.push_str(after_start);
-                return (cleaned, helper_names);
+                return helper_names;
             };
 
             let helper_name = after_start[..end].trim();
             if !helper_name.is_empty() {
                 helper_names.push(helper_name.to_string());
-                cleaned.push('@');
-                cleaned.push_str(helper_name);
             }
 
             remaining = &after_start[end + 1..];
         }
 
-        cleaned.push_str(remaining);
-        (cleaned, helper_names)
+        helper_names
     }
 
     fn build_task_context(&self, sender: &str, room_id: String, message: &str) -> TaskContext {
@@ -289,8 +291,8 @@ impl MatrixAdkAgent {
         let task_id = Self::extract_marker_value(message, "[Task:", ']');
         let without_internal_markers = Self::strip_marker(message, "[TaskComplete:");
         let without_requester_marker = Self::strip_marker(&without_internal_markers, "[Requester:");
-        let without_task_marker = Self::strip_marker(&without_requester_marker, "[Task:");
-        let (text, helper_names) = Self::extract_helper_tags(&without_task_marker);
+        let text = Self::strip_marker(&without_requester_marker, "[Task:");
+        let helper_names = Self::extract_helper_tags(&text);
 
         AgentResponse {
             text: text.trim().to_string(),
@@ -324,8 +326,13 @@ impl MatrixAdkAgent {
         text
     }
 
-    fn resolve_mentions(&self, response: &AgentResponse, task_context: &TaskContext) -> Vec<OwnedUserId> {
-        let mut user_ids = self.resolve_user_mentions(&response.helper_names);
+    async fn resolve_mentions(
+        &self,
+        response: &AgentResponse,
+        task_context: &TaskContext,
+        room: &Room,
+    ) -> Vec<MentionTarget> {
+        let mut mentions = self.resolve_user_mentions(&response.helper_names);
 
         if response.is_completion() {
             let requester = response
@@ -333,15 +340,26 @@ impl MatrixAdkAgent {
                 .as_deref()
                 .unwrap_or(&task_context.requester);
             if let Ok(user_id) = UserId::parse(requester) {
-                user_ids.push(user_id);
+                mentions.push(MentionTarget {
+                    label: user_id.to_string(),
+                    user_id,
+                    source_tag: None,
+                });
             } else {
                 eprintln!("Skipping invalid requester user id '{requester}'");
             }
         }
 
-        user_ids.sort();
-        user_ids.dedup();
-        user_ids
+        mentions.sort_by(|left, right| left.user_id.cmp(&right.user_id));
+        mentions.dedup_by(|left, right| left.user_id == right.user_id);
+
+        for mention in &mut mentions {
+            if let Some(room_label) = Self::lookup_room_label(room, mention.user_id.as_ref()).await {
+                mention.label = room_label;
+            }
+        }
+
+        mentions
     }
 
     fn extract_marker_value(message: &str, prefix: &str, suffix: char) -> Option<String> {
@@ -373,13 +391,17 @@ impl MatrixAdkAgent {
         stripped
     }
 
-    fn resolve_user_mentions(&self, helper_names: &[String]) -> Vec<OwnedUserId> {
-        let mut user_ids = Vec::new();
+    fn resolve_user_mentions(&self, helper_names: &[String]) -> Vec<MentionTarget> {
+        let mut mentions = Vec::new();
 
         for helper_name in helper_names {
             for user_id in self.adk_agent.find_helper_user_ids_by_name(helper_name) {
                 match UserId::parse(user_id.clone()) {
-                    Ok(owned) => user_ids.push(owned),
+                    Ok(owned) => mentions.push(MentionTarget {
+                        label: helper_name.clone(),
+                        user_id: owned,
+                        source_tag: Some(helper_name.clone()),
+                    }),
                     Err(_) => {
                         eprintln!("Skipping invalid helper user id '{user_id}' for '{helper_name}'");
                     }
@@ -387,10 +409,145 @@ impl MatrixAdkAgent {
             }
         }
 
-        user_ids.sort();
-        user_ids.dedup();
-        user_ids
+        mentions.sort_by(|left, right| left.user_id.cmp(&right.user_id));
+        mentions.dedup_by(|left, right| left.user_id == right.user_id);
+        mentions
     }
+
+    fn attach_visible_mentions(
+        message: String,
+        mention_targets: &[MentionTarget],
+    ) -> (String, Option<String>) {
+        if mention_targets.is_empty() {
+            return (message, None);
+        }
+
+        let mut plain = message.trim().to_string();
+        let mut html = Self::text_to_html(&plain);
+        let mut used_ids: HashSet<OwnedUserId> = HashSet::new();
+        let mut handled_tags: HashSet<String> = HashSet::new();
+
+        for target in mention_targets.iter().filter(|target| target.source_tag.is_some()) {
+            let Some(source_tag) = target.source_tag.as_ref() else {
+                continue;
+            };
+            if !handled_tags.insert(source_tag.clone()) {
+                continue;
+            }
+
+            let grouped = mention_targets
+                .iter()
+                .filter(|candidate| candidate.source_tag.as_deref() == Some(source_tag.as_str()))
+                .collect::<Vec<_>>();
+
+            if grouped.is_empty() {
+                continue;
+            }
+
+            let placeholder = format!("@[{}]", source_tag);
+            let plain_mention = grouped
+                .iter()
+                .map(|candidate| format!("@[{}]", candidate.label))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let html_mention = grouped
+                .iter()
+                .map(|candidate| {
+                    format!(
+                        "<a href=\"https://matrix.to/#/{}\">@[{}]</a>",
+                        candidate.user_id,
+                        Self::escape_html(&candidate.label)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+
+            if plain.contains(&placeholder) {
+                plain = plain.replace(&placeholder, &plain_mention);
+                html = html.replace(&placeholder, &html_mention);
+                for candidate in grouped {
+                    used_ids.insert(candidate.user_id.clone());
+                }
+            }
+        }
+
+        let trailing = mention_targets
+            .iter()
+            .filter(|target| !used_ids.contains(&target.user_id))
+            .collect::<Vec<_>>();
+
+        if !trailing.is_empty() {
+            let trailing_plain = trailing
+                .iter()
+                .map(|target| format!("@[{}]", target.label))
+                .collect::<Vec<_>>()
+                .join(" ");
+
+            let trailing_html = trailing
+                .iter()
+                .map(|target| {
+                    format!(
+                        "<a href=\"https://matrix.to/#/{}\">@[{}]</a>",
+                        target.user_id,
+                        Self::escape_html(&target.label)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+
+            if plain.is_empty() {
+                plain = trailing_plain;
+                html = trailing_html;
+            } else {
+                plain = format!("{plain} {trailing_plain}");
+                html = format!("{html} {trailing_html}");
+            }
+        }
+
+        if plain.is_empty() {
+            return (plain, None);
+        }
+
+        (plain, Some(html))
+    }
+
+    fn text_to_html(input: &str) -> String {
+        Self::escape_html(input).replace('\n', "<br>")
+    }
+
+    fn escape_html(input: &str) -> String {
+        let mut escaped = String::with_capacity(input.len());
+        for ch in input.chars() {
+            match ch {
+                '&' => escaped.push_str("&amp;"),
+                '<' => escaped.push_str("&lt;"),
+                '>' => escaped.push_str("&gt;"),
+                '"' => escaped.push_str("&quot;"),
+                '\'' => escaped.push_str("&#39;"),
+                _ => escaped.push(ch),
+            }
+        }
+        escaped
+    }
+
+    async fn lookup_room_label(room: &Room, user_id: &UserId) -> Option<String> {
+        let member = match room.get_member(user_id).await {
+            Ok(member) => member,
+            Err(_) => return None,
+        }?;
+
+        member
+            .display_name()
+            .map(str::trim)
+            .filter(|label| !label.is_empty())
+            .map(ToOwned::to_owned)
+    }
+}
+
+struct MentionTarget {
+    user_id: OwnedUserId,
+    label: String,
+    source_tag: Option<String>,
 }
 
 struct TaskMetadata {
