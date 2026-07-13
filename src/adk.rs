@@ -1,10 +1,5 @@
 use adk_rust::{
-    futures::StreamExt as _,
-    model::openai::{OpenAIResponsesClient, OpenAIResponsesConfig},
-    prelude::*,
-    serde_json::json,
-    Artifacts, CallbackContext, InvocationContext, Memory, ReadonlyContext, RunConfig, Session,
-    State,
+    SessionId, UserId, futures::StreamExt as _, model::openai::{OpenAIResponsesClient, OpenAIResponsesConfig}, prelude::*, runner::RunnerConfigBuilder, serde_json::json, session::SessionService,
 };
 
 use anyhow::{Context, Result};
@@ -12,18 +7,35 @@ use std::{
     collections::HashMap,
     fs,
     path::PathBuf,
-    sync::atomic::{AtomicBool, Ordering},
     sync::{Arc, Mutex},
 };
 
 const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful assistant.";
-const COLLABORATION_PROTOCOL: &str = "When you receive a chat message, first inspect the known participant introductions with the get_known_introductions tool before deciding whether to answer yourself or collaborate. Use those introductions to judge who is best suited for the task.\n\nIf you are asked to introduce yourself, use the introduce_yourself tool and return only its result, nothing more.\n\nYou may receive a task context block containing task_id, requester, sender, room_id, and the original message. Keep the task_id stable across all collaboration messages.\n\nIf another participant is better suited or collaboration is needed, respond with a message that includes `[Task: <task_id>]` and mention collaborators as `@[Agent-Name]`.\n\nIf you complete the task yourself, include `[TaskComplete: <task_id>]` in your reply. When a requester is provided in the context, also include `[Requester: <requester_user_id>]`.\n\nDo not invent collaborators. Base delegation decisions on known introductions.";
+const COLLABORATION_PROTOCOL: &str = r#"When you receive a chat message, first inspect the known participant introductions 
+    with the get_known_introductions tool before deciding whether to answer yourself or collaborate. Use those introductions 
+    to judge who is best suited for the task.
+    
+    If you are asked to introduce yourself, use the introduce_yourself tool and return only its result, nothing more.
+    
+    You may receive a task context block containing task_id, requester, sender, room_id, and the original message. Keep the task_id stable across 
+    all collaboration messages.
+    
+    If another participant is better suited or collaboration is needed, respond with a message that includes `[Task: <task_id>]` and mention collaborators 
+    as `@[Agent-Name]`.
+    
+    If you complete the task yourself, include `[TaskComplete: <task_id>]` in your reply. When a requester is provided in the context, also include `[Requester: <requester_user_id>]`.
+    
+    Do not invent collaborators. Base delegation decisions on known introductions.
+    "#;
+
+const DEFAULT_INTRODUCTION: &str = "Hello! I am an AI assistant. How can I help you today?";
 
 #[derive(Clone)]
 pub struct AdkOpenAiAgentConfig {
     introduction: Option<String>,
     system_prompt: Option<String>,
     introductions_file: PathBuf,
+    introduction_file: PathBuf,
     open_responses_model: String,
     open_responses_base_url: String,
     openai_api_key: String,
@@ -32,8 +44,9 @@ pub struct AdkOpenAiAgentConfig {
 #[derive(Clone)]
 pub struct AdkOpenAiAgent {
     config: AdkOpenAiAgentConfig,
-    client: Arc<OpenAIResponsesClient>,
     introductions: Arc<Mutex<HashMap<String, String>>>,
+    llm_agent: Arc<dyn Agent>,
+    session_service: Arc<dyn SessionService>,
 }
 
 impl AdkOpenAiAgentConfig {
@@ -47,8 +60,10 @@ impl AdkOpenAiAgentConfig {
         let introductions_file = std::env::var("INTRODUCTIONS_FILE")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from(".matrix-store/introductions.json"));
+        let introduction_file = std::env::var("INTRODUCTION_FILE").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("INTRODUCTION.md"));
         Ok(Self {
             introduction: None,
+            introduction_file: introduction_file,
             system_prompt: None,
             introductions_file,
             open_responses_model: model,
@@ -84,65 +99,9 @@ impl AdkOpenAiAgent {
                 .with_reasoning_summary(adk_rust::model::openai::ReasoningSummary::Concise)
                 .with_base_url(&config.open_responses_base_url);
 
-        let client = OpenAIResponsesClient::new(ai_config)?;
-        let introductions = Self::load_introductions(&config.introductions_file)?;
-
-        Ok(Self {
-            config: config,
-            client: Arc::new(client),
-            introductions: Arc::new(Mutex::new(introductions)),
-        })
-    }
-
-    pub fn remember_introduction(&self, name: String, introduction: String) {
-        if let Ok(mut introductions) = self.introductions.lock() {
-            introductions.insert(name, introduction);
-            if let Err(err) = Self::persist_introductions(
-                &self.config.introductions_file,
-                &introductions,
-            ) {
-                eprintln!(
-                    "Failed to persist introductions to {}: {err}",
-                    self.config.introductions_file.display()
-                );
-            }
-        }
-    }
-
-    pub fn find_helper_user_ids_by_name(&self, name: &str) -> Vec<String> {
-        let requested = name.trim().to_lowercase();
-        if requested.is_empty() {
-            return Vec::new();
-        }
-
-        let Ok(introductions) = self.introductions.lock() else {
-            return Vec::new();
-        };
-
-        let mut matches: Vec<String> = introductions
-            .keys()
-            .filter(|known_name| {
-                let known = known_name.to_lowercase();
-                known == requested || known.contains(&requested)
-            })
-            .cloned()
-            .collect();
-        matches.sort();
-        matches.dedup();
-        matches
-    }
-
-    pub fn introduction(&self) -> String {
-        if let Some(introduction) = &self.config.introduction {
-            introduction.clone()
-        } else {
-            "Hello! I am an AI assistant. How can I help you today?".to_string()
-        }
-    }
-
-    pub async fn ask(self: &Arc<Self>, message: String) -> Result<String, anyhow::Error> {
-        let mut system_prompt = self
-            .config
+        let client = Arc::new(OpenAIResponsesClient::new(ai_config)?);
+        
+        let mut system_prompt = config
             .system_prompt
             .clone()
             .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
@@ -150,7 +109,7 @@ impl AdkOpenAiAgent {
         system_prompt.push_str("\n\n");
         system_prompt.push_str(COLLABORATION_PROTOCOL);
 
-        let introduction = self.introduction();
+        let introduction = Self::introduction(&config);
         let introduction_tool = Arc::new(FunctionTool::new(
             "introduce_yourself",
             "Return the configured self-introduction string.",
@@ -160,12 +119,14 @@ impl AdkOpenAiAgent {
             },
         ));
 
-        let introductions = Arc::clone(&self.introductions);
+        let introductions = Self::load_introductions(&config.introductions_file)?;
+        let moving_introductions = Arc::new(Mutex::new(introductions.clone()));
+        let stored_introductions = Arc::new(Mutex::new(introductions));
         let known_introductions_tool = Arc::new(FunctionTool::new(
             "get_known_introductions",
             "Return all known introductions. Optional arg 'name' filters by helper name (supports case-insensitive partial match).",
             move |_ctx, args| {
-                let introductions = Arc::clone(&introductions);
+                let introductions = Arc::clone(&moving_introductions);
                 async move {
                     let requested_name = args
                         .get("name")
@@ -224,17 +185,92 @@ impl AdkOpenAiAgent {
             },
         ));
 
-        let llm_agent = Arc::new(
-            LlmAgentBuilder::new("adk-openai-agent")
-                .description("Agent wrapper around the OpenAI Responses client")
-                .model(self.client.clone())
-                .instruction(system_prompt)
-                .tool(introduction_tool)
-                .tool(known_introductions_tool)
-                .build()?,
-        );
+        let session_service = Arc::new(InMemorySessionService::new());
 
-        let invocation_context = Arc::new(SimpleInvocationContext::new(llm_agent.clone(), message));
+        let llm_agent = LlmAgentBuilder::new("adk-openai-agent")
+                    .description("Agent wrapper around the OpenAI Responses client")
+                    .model(client.clone())
+                    .instruction(system_prompt)
+                    .tool(introduction_tool)
+                    .tool(known_introductions_tool)
+                    .build()?;
+
+        Ok(Self {
+            config: config,
+            introductions: stored_introductions.clone(),
+            llm_agent: Arc::new(llm_agent),
+            session_service: session_service,
+        })
+    }
+
+    pub fn remember_introduction(&self, name: String, introduction: String) {
+        if let Ok(mut introductions) = self.introductions.lock() {
+            introductions.insert(name, introduction);
+            if let Err(err) = Self::persist_introductions(
+                &self.config.introductions_file,
+                &introductions,
+            ) {
+                eprintln!(
+                    "Failed to persist introductions to {}: {err}",
+                    self.config.introductions_file.display()
+                );
+            }
+        }
+    }
+
+    pub fn find_helper_user_ids_by_name(&self, name: &str) -> Vec<String> {
+        let requested = name.trim().to_lowercase();
+        if requested.is_empty() {
+            return Vec::new();
+        }
+
+        let Ok(introductions) = self.introductions.lock() else {
+            return Vec::new();
+        };
+
+        let mut matches: Vec<String> = introductions
+            .keys()
+            .filter(|known_name| {
+                let known = known_name.to_lowercase();
+                known == requested || known.contains(&requested)
+            })
+            .cloned()
+            .collect();
+        matches.sort();
+        matches.dedup();
+        matches
+    }
+
+    pub fn introduction(config: &AdkOpenAiAgentConfig) -> String {
+        let mut resulting_introduction = "".to_string();
+        if let Some(introduction) = &config.introduction {
+            resulting_introduction.push_str(&introduction);
+        } else {
+            if config.introduction_file.exists() {
+                let file_introduction = match fs::read_to_string(&config.introduction_file) {
+                    Ok(file_introduction) => file_introduction,
+                    Err(e) => {
+                        println!("[Error] Error reading introduction file {}", e.to_string());
+                        DEFAULT_INTRODUCTION.to_string()
+                    }
+                };
+                resulting_introduction.push_str(&file_introduction);
+            } else {
+                return DEFAULT_INTRODUCTION.to_string();
+            }
+        }
+        resulting_introduction
+    }
+
+    pub async fn ask(self: &Arc<Self>, room_id: String, task_id: &String, message: String) -> Result<String, anyhow::Error> {
+        
+        let runner = Runner::new(RunnerConfigBuilder::new().agent(self.llm_agent.clone()).app_name("chatbot").session_service(self.session_service.clone()).build_config())?;
+        let user_content = Content::new("user").with_text(message);
+        let mut stream = runner.run(
+            UserId::new(room_id)?,
+            SessionId::new(task_id)?,
+            user_content,
+        ).await?;
 
         // Send prompt and stream the response
         println!(
@@ -243,7 +279,6 @@ impl AdkOpenAiAgent {
         );
         println!();
 
-        let mut stream = llm_agent.run(invocation_context).await?;
         let mut received_content = false;
 
         let mut response_text = String::new();
@@ -301,149 +336,3 @@ impl AdkOpenAiAgent {
     }
 }
 
-struct SimpleState {
-    values: Mutex<HashMap<String, adk_rust::serde_json::Value>>,
-}
-
-impl SimpleState {
-    fn new() -> Self {
-        Self {
-            values: Mutex::new(HashMap::new()),
-        }
-    }
-}
-
-impl State for SimpleState {
-    fn get(&self, key: &str) -> Option<adk_rust::serde_json::Value> {
-        self.values.lock().ok().and_then(|values| values.get(key).cloned())
-    }
-
-    fn set(&mut self, key: String, value: adk_rust::serde_json::Value) {
-        if let Ok(mut values) = self.values.lock() {
-            values.insert(key, value);
-        }
-    }
-
-    fn all(&self) -> HashMap<String, adk_rust::serde_json::Value> {
-        self.values.lock().map(|values| values.clone()).unwrap_or_default()
-    }
-}
-
-struct SimpleSession {
-    state: SimpleState,
-}
-
-impl SimpleSession {
-    fn new() -> Self {
-        Self {
-            state: SimpleState::new(),
-        }
-    }
-}
-
-impl Session for SimpleSession {
-    fn id(&self) -> &str {
-        "adk-openai-session"
-    }
-
-    fn app_name(&self) -> &str {
-        "matrix-adk-agent-rs"
-    }
-
-    fn user_id(&self) -> &str {
-        "cli-user"
-    }
-
-    fn state(&self) -> &dyn State {
-        &self.state
-    }
-
-    fn conversation_history(&self) -> Vec<Content> {
-        Vec::new()
-    }
-}
-
-struct SimpleInvocationContext {
-    agent: Arc<dyn Agent>,
-    content: Content,
-    config: RunConfig,
-    session: SimpleSession,
-    ended: AtomicBool,
-}
-
-impl SimpleInvocationContext {
-    fn new(agent: Arc<dyn Agent>, message: String) -> Self {
-        Self {
-            agent,
-            content: Content::new("user").with_text(message),
-            config: RunConfig::default(),
-            session: SimpleSession::new(),
-            ended: AtomicBool::new(false),
-        }
-    }
-}
-
-#[async_trait]
-impl ReadonlyContext for SimpleInvocationContext {
-    fn invocation_id(&self) -> &str {
-        "adk-openai-invocation"
-    }
-
-    fn agent_name(&self) -> &str {
-        self.agent.name()
-    }
-
-    fn user_id(&self) -> &str {
-        self.session.user_id()
-    }
-
-    fn app_name(&self) -> &str {
-        self.session.app_name()
-    }
-
-    fn session_id(&self) -> &str {
-        self.session.id()
-    }
-
-    fn branch(&self) -> &str {
-        ""
-    }
-
-    fn user_content(&self) -> &Content {
-        &self.content
-    }
-}
-
-#[async_trait]
-impl CallbackContext for SimpleInvocationContext {
-    fn artifacts(&self) -> Option<Arc<dyn Artifacts>> {
-        None
-    }
-}
-
-#[async_trait]
-impl InvocationContext for SimpleInvocationContext {
-    fn agent(&self) -> Arc<dyn Agent> {
-        self.agent.clone()
-    }
-
-    fn memory(&self) -> Option<Arc<dyn Memory>> {
-        None
-    }
-
-    fn session(&self) -> &dyn Session {
-        &self.session
-    }
-
-    fn run_config(&self) -> &RunConfig {
-        &self.config
-    }
-
-    fn end_invocation(&self) {
-        self.ended.store(true, Ordering::SeqCst);
-    }
-
-    fn ended(&self) -> bool {
-        self.ended.load(Ordering::SeqCst)
-    }
-}

@@ -188,7 +188,7 @@ impl MatrixAdkAgent {
                 if let Err(_) = room.typing_notice(true).await {}
                 let result_content = self
                     .adk_agent
-                    .ask(question)
+                    .ask(room.room_id().into(), &task_context.task_id, question)
                     .await
                     .unwrap();
                 println!("Result: {result_content}");
