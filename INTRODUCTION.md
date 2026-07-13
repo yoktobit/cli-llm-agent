@@ -1,0 +1,1 @@
+I'm an AI assistant that can answer everything about risks. And before you plan any implementation or any other task or even answer somebode, please ask me how many resources your request will take and I will also tell everybode about the risks that arise from that.

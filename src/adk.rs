@@ -1,5 +1,5 @@
 use adk_rust::{
-    SessionId, UserId, futures::StreamExt as _, model::openai::{OpenAIResponsesClient, OpenAIResponsesConfig}, prelude::*, runner::RunnerConfigBuilder, serde_json::json, session::SessionService,
+    SessionId, UserId, futures::StreamExt as _, model::openai::{OpenAIResponsesClient, OpenAIResponsesConfig}, prelude::*, runner::RunnerConfigBuilder, serde_json::json, session::{CreateRequest, GetRequest, SessionService},
 };
 
 use anyhow::{Context, Result};
@@ -11,6 +11,8 @@ use std::{
 };
 
 const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful assistant.";
+const APP_NAME: &str = "chatbot";
+const DEFAULT_SESSION_ID: &str = "main";
 const COLLABORATION_PROTOCOL: &str = r#"When you receive a chat message, first inspect the known participant introductions 
     with the get_known_introductions tool before deciding whether to answer yourself or collaborate. Use those introductions 
     to judge who is best suited for the task.
@@ -39,6 +41,7 @@ pub struct AdkOpenAiAgentConfig {
     open_responses_model: String,
     open_responses_base_url: String,
     openai_api_key: String,
+    tools: Vec<Arc<dyn Tool>>,
 }
 
 #[derive(Clone)]
@@ -69,6 +72,7 @@ impl AdkOpenAiAgentConfig {
             open_responses_model: model,
             open_responses_base_url: base_url,
             openai_api_key: api_key,
+            tools: Vec::new(),
         })
     }
     pub fn with_system_prompt(mut self, prompt: String) -> Self {
@@ -77,6 +81,10 @@ impl AdkOpenAiAgentConfig {
     }
     pub fn with_introduction(mut self, introduction: String) -> Self {
         self.introduction = Some(introduction);
+        self
+    }
+    pub fn with_tools(mut self, tools: Vec<Arc<dyn Tool>>) -> Self {
+        self.tools = tools;
         self
     }
 }
@@ -254,6 +262,7 @@ impl AdkOpenAiAgent {
                         DEFAULT_INTRODUCTION.to_string()
                     }
                 };
+                print!("Loaded introduction from {}: {}", config.introduction_file.display(), file_introduction);
                 resulting_introduction.push_str(&file_introduction);
             } else {
                 return DEFAULT_INTRODUCTION.to_string();
@@ -263,12 +272,50 @@ impl AdkOpenAiAgent {
     }
 
     pub async fn ask(self: &Arc<Self>, room_id: String, task_id: &String, message: String) -> Result<String, anyhow::Error> {
-        
-        let runner = Runner::new(RunnerConfigBuilder::new().agent(self.llm_agent.clone()).app_name("chatbot").session_service(self.session_service.clone()).build_config())?;
+
+        let user_id = UserId::new(room_id.clone())?;
+        let session_id = SessionId::new(task_id.clone())?;
+
+        // Runner::run expects an existing session; create it once per room if missing.
+        match self
+            .session_service
+            .get(GetRequest {
+                app_name: APP_NAME.to_string(),
+                user_id: user_id.to_string(),
+                session_id: session_id.to_string(),
+                num_recent_events: None,
+                after: None,
+            })
+            .await
+        {
+            Ok(_) => {}
+            Err(err) => {
+                if err.to_string().contains("session not found") {
+                    self.session_service
+                        .create(CreateRequest {
+                            app_name: APP_NAME.to_string(),
+                            user_id: user_id.to_string(),
+                            session_id: Some(session_id.to_string()),
+                            state: HashMap::new(),
+                        })
+                        .await?;
+                } else {
+                    return Err(err.into());
+                }
+            }
+        }
+
+        let runner = Runner::new(
+            RunnerConfigBuilder::new()
+            .agent(self.llm_agent.clone())
+            .app_name(APP_NAME)
+            .session_service(self.session_service.clone())
+            .build_config())?;
         let user_content = Content::new("user").with_text(message);
+        
         let mut stream = runner.run(
-            UserId::new(room_id)?,
-            SessionId::new(task_id)?,
+            user_id,
+            session_id,
             user_content,
         ).await?;
 

@@ -67,17 +67,6 @@ impl MatrixAdkAgent {
         self.matrix_agent.clone()
     }
 
-    // pub fn add_message_handler<F, Fut>(&mut self, f: F)
-    // where
-    //     F: Fn(Arc<MatrixAdkAgent>, MessageEvent, Room) -> Fut + Send + Sync + 'static,
-    //     Fut: Future<Output = Result<(), anyhow::Error>> + Send + 'static,
-    // {
-    //     self.message_handlers
-    //         .push(Arc::new(move |agent, event, room| {
-    //             Box::pin(f(agent, event, room))
-    //         }));
-    // }
-
     pub fn add_default_message_handler_for_room(self: &Arc<Self>, room: Room) {
         let agent: Arc<MatrixAdkAgent> = Arc::clone(self);
         room.add_event_handler(|event, room| async move {
@@ -93,19 +82,6 @@ impl MatrixAdkAgent {
                 agent.on_room_message(event, room).await;
             });
     }
-
-    // pub fn register_message_handlers_for_room(self: &Arc<Self>, room: Room) {
-    //     for handler in self.message_handlers.iter().cloned() {
-    //         let agent = Arc::clone(self);
-
-    //         room.add_event_handler(move |event: MessageEvent, room: Room| {
-    //             let handler = Arc::clone(&handler);
-    //             let agent = Arc::clone(&agent);
-
-    //             async move { if let Err(err) = handler(agent, event, room).await {} }
-    //         });
-    //     }
-    // }
 
     async fn on_stripped_state_member(
         self: &Arc<Self>,
