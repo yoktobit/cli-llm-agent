@@ -1,4 +1,4 @@
-use std::{collections::HashSet, sync::Arc, sync::atomic::{AtomicU64, Ordering}, time::Duration};
+use std::{collections::{HashMap, HashSet}, sync::{Arc, Mutex}, sync::atomic::{AtomicU64, Ordering}, time::Duration};
 
 use matrix_sdk::ruma::events::Mentions;
 use matrix_sdk::ruma::events::SyncMessageLikeEvent;
@@ -16,6 +16,7 @@ pub struct MatrixAdkAgent {
     adk_agent: Arc<AdkOpenAiAgent>,
     auto_join: bool,
     task_counter: Arc<AtomicU64>,
+    task_requesters: Arc<Mutex<HashMap<String, String>>>,
     // TODO: Weitere Handler erlauben
     // join_handlers: Vec<JoinHandler>,
     // message_handlers: Vec<MessageHandler>,
@@ -34,6 +35,7 @@ impl MatrixAdkAgent {
             adk_agent: Arc::new(adk_agent),
             auto_join: auto_join,
             task_counter: Arc::new(AtomicU64::new(1)),
+            task_requesters: Arc::new(Mutex::new(HashMap::new())),
             // join_handlers: join_handlers,
             // message_handlers: message_handlers,
         };
@@ -137,11 +139,18 @@ impl MatrixAdkAgent {
                 };
 
                 let message_body = text_content.body.clone();
+                if Self::starts_with_task_failed_marker(&message_body) {
+                    println!("got failed-task message, ignoring");
+                    return;
+                }
+
                 if let Some(introduction) = Self::extract_introduction(&message_body) {
                     let sender = event.sender.to_string();
-                    self.adk_agent
-                        .remember_introduction(sender.clone(), introduction.clone());
-                    println!("Stored introduction from {sender}: {introduction}");
+                    if sender != room.own_user_id().to_string() {
+                        self.adk_agent
+                            .remember_introduction(sender.clone(), introduction.clone());
+                        println!("Stored introduction from {sender}: {introduction}");
+                    }
                 }
 
                 let mentioned = event.content.mentions.iter().any(|mention| {
@@ -216,6 +225,15 @@ impl MatrixAdkAgent {
         Some(introduction.to_string())
     }
 
+    fn starts_with_task_failed_marker(message: &str) -> bool {
+        let trimmed = message.trim_start();
+        if !trimmed.starts_with("[TaskFailed:") {
+            return false;
+        }
+
+        Self::extract_marker_value(trimmed, "[TaskFailed:", ']').is_some()
+    }
+
     fn extract_helper_tags(message: &str) -> Vec<String> {
         let mut helper_names = Vec::new();
         let mut remaining = message;
@@ -234,6 +252,69 @@ impl MatrixAdkAgent {
             remaining = &after_start[end + 1..];
         }
 
+        for helper_name in Self::extract_bare_helper_tags(message) {
+            if !helper_names.contains(&helper_name) {
+                helper_names.push(helper_name);
+            }
+        }
+
+        helper_names
+    }
+
+    fn extract_bare_helper_tags(message: &str) -> Vec<String> {
+        let chars = message.char_indices().collect::<Vec<_>>();
+        let mut helper_names = Vec::new();
+        let mut index = 0;
+
+        while index < chars.len() {
+            let (start_offset, current) = chars[index];
+            if current != '@' {
+                index += 1;
+                continue;
+            }
+
+            if chars
+                .get(index + 1)
+                .is_some_and(|(_, next)| *next == '[')
+            {
+                index += 1;
+                continue;
+            }
+
+            if index > 0 {
+                let previous = chars[index - 1].1;
+                if previous.is_alphanumeric() || matches!(previous, '_' | '.' | '+' | '-') {
+                    index += 1;
+                    continue;
+                }
+            }
+
+            let mut end_offset = start_offset + current.len_utf8();
+            let mut cursor = index + 1;
+            while let Some((offset, ch)) = chars.get(cursor).copied() {
+                if ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':') {
+                    end_offset = offset + ch.len_utf8();
+                    cursor += 1;
+                    continue;
+                }
+                break;
+            }
+
+            if end_offset == start_offset + current.len_utf8() {
+                index += 1;
+                continue;
+            }
+
+            let helper_name = message[start_offset + current.len_utf8()..end_offset]
+                .trim()
+                .trim_end_matches(|ch: char| matches!(ch, '.' | ',' | '!' | '?' | ';' | ')'));
+            if !helper_name.is_empty() {
+                helper_names.push(helper_name.to_string());
+            }
+
+            index = cursor;
+        }
+
         helper_names
     }
 
@@ -242,9 +323,11 @@ impl MatrixAdkAgent {
         let task_id = parsed
             .task_id
             .unwrap_or_else(|| self.next_task_id());
-        let requester = parsed
-            .requester
-            .unwrap_or_else(|| sender.to_string());
+        let requester = self.resolve_requester_for_task(
+            &task_id,
+            parsed.requester.as_deref(),
+            sender,
+        );
 
         TaskContext {
             task_id,
@@ -259,6 +342,49 @@ impl MatrixAdkAgent {
     fn next_task_id(&self) -> String {
         let task_number = self.task_counter.fetch_add(1, Ordering::Relaxed);
         format!("task-{task_number}")
+    }
+
+    fn resolve_requester_for_task(
+        &self,
+        task_id: &str,
+        explicit_requester: Option<&str>,
+        sender: &str,
+    ) -> String {
+        let mut task_requesters = match self.task_requesters.lock() {
+            Ok(task_requesters) => task_requesters,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        Self::resolve_requester_for_task_map(
+            &mut task_requesters,
+            task_id,
+            explicit_requester,
+            sender,
+        )
+    }
+
+    fn resolve_requester_for_task_map(
+        task_requesters: &mut HashMap<String, String>,
+        task_id: &str,
+        explicit_requester: Option<&str>,
+        sender: &str,
+    ) -> String {
+        if let Some(requester) = explicit_requester
+            .map(str::trim)
+            .filter(|requester| !requester.is_empty())
+        {
+            let requester = requester.to_string();
+            task_requesters.insert(task_id.to_string(), requester.clone());
+            return requester;
+        }
+
+        if let Some(requester) = task_requesters.get(task_id) {
+            return requester.clone();
+        }
+
+        let requester = sender.to_string();
+        task_requesters.insert(task_id.to_string(), requester.clone());
+        requester
     }
 
     fn parse_agent_response(message: &str) -> AgentResponse {
@@ -328,7 +454,7 @@ impl MatrixAdkAgent {
 
         mentions.sort_by(|left, right| left.user_id.cmp(&right.user_id));
         mentions.dedup_by(|left, right| left.user_id == right.user_id);
-
+        mentions = mentions.into_iter().filter(|x| x.user_id != room.own_user_id()).collect();
         for mention in &mut mentions {
             if let Some(room_label) = Self::lookup_room_label(room, mention.user_id.as_ref()).await {
                 mention.label = room_label;
@@ -421,6 +547,7 @@ impl MatrixAdkAgent {
             }
 
             let placeholder = format!("@[{}]", source_tag);
+            let bare_placeholder = format!("@{}", source_tag);
             let plain_mention = grouped
                 .iter()
                 .map(|candidate| format!("@[{}]", candidate.label))
@@ -443,6 +570,20 @@ impl MatrixAdkAgent {
                 html = html.replace(&placeholder, &html_mention);
                 for candidate in grouped {
                     used_ids.insert(candidate.user_id.clone());
+                }
+            } else {
+                let (updated_plain, replaced_plain) =
+                    Self::replace_mention_token(&plain, &bare_placeholder, &plain_mention);
+                if replaced_plain {
+                    let (updated_html, replaced_html) =
+                        Self::replace_mention_token(&html, &bare_placeholder, &html_mention);
+                    if replaced_html {
+                        plain = updated_plain;
+                        html = updated_html;
+                        for candidate in grouped {
+                            used_ids.insert(candidate.user_id.clone());
+                        }
+                    }
                 }
             }
         }
@@ -489,6 +630,45 @@ impl MatrixAdkAgent {
 
     fn text_to_html(input: &str) -> String {
         Self::escape_html(input).replace('\n', "<br>")
+    }
+
+    fn replace_mention_token(input: &str, token: &str, replacement: &str) -> (String, bool) {
+        let mut replaced = false;
+        let mut result = String::with_capacity(input.len());
+        let mut remaining = input;
+
+        while let Some(position) = remaining.find(token) {
+            let prefix = &remaining[..position];
+            let suffix = &remaining[position + token.len()..];
+
+            if Self::is_mention_boundary_before(prefix.chars().next_back())
+                && Self::is_mention_boundary_after(suffix.chars().next())
+            {
+                result.push_str(prefix);
+                result.push_str(replacement);
+                remaining = suffix;
+                replaced = true;
+            } else {
+                let mut chars = remaining.chars();
+                if let Some(ch) = chars.next() {
+                    result.push(ch);
+                    remaining = chars.as_str();
+                } else {
+                    break;
+                }
+            }
+        }
+
+        result.push_str(remaining);
+        (result, replaced)
+    }
+
+    fn is_mention_boundary_before(ch: Option<char>) -> bool {
+        ch.is_none_or(|value| !(value.is_alphanumeric() || matches!(value, '_' | '.' | '+' | '-')))
+    }
+
+    fn is_mention_boundary_after(ch: Option<char>) -> bool {
+        ch.is_none_or(|value| !(value.is_alphanumeric() || matches!(value, '_' | '-' | '.' | ':')))
     }
 
     fn escape_html(input: &str) -> String {
@@ -580,5 +760,101 @@ struct AgentResponse {
 impl AgentResponse {
     fn is_completion(&self) -> bool {
         self.completion_task_id.is_some() || (self.helper_names.is_empty() && !self.text.is_empty())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MatrixAdkAgent;
+    use super::MentionTarget;
+    use matrix_sdk::ruma::OwnedUserId;
+    use std::collections::HashMap;
+
+    #[test]
+    fn extract_helper_tags_supports_bare_mentions() {
+        let helper_names = MatrixAdkAgent::extract_helper_tags(
+            "Please coordinate with @Agent-One and @[Agent Two].",
+        );
+
+        assert_eq!(helper_names, vec!["Agent Two", "Agent-One"]);
+    }
+
+    #[test]
+    fn extract_helper_tags_ignores_email_addresses() {
+        let helper_names = MatrixAdkAgent::extract_helper_tags(
+            "Reach me at martin@example.com, then loop in @Agent-One.",
+        );
+
+        assert_eq!(helper_names, vec!["Agent-One"]);
+    }
+
+    #[test]
+    fn attach_visible_mentions_upgrades_bare_helper_mentions() {
+        let mention_targets = vec![MentionTarget {
+            user_id: OwnedUserId::try_from("@agent-one:example.com").unwrap(),
+            label: "Agent One".to_string(),
+            source_tag: Some("Agent-One".to_string()),
+        }];
+
+        let (plain, html) = MatrixAdkAgent::attach_visible_mentions(
+            "Please ask @Agent-One to review this.".to_string(),
+            &mention_targets,
+        );
+
+        assert_eq!(plain, "Please ask @[Agent One] to review this.");
+        assert_eq!(
+            html.unwrap(),
+            "Please ask <a href=\"https://matrix.to/#/@agent-one:example.com\">@[Agent One]</a> to review this."
+        );
+    }
+
+    #[test]
+    fn starts_with_task_failed_marker_matches_trimmed_prefix() {
+        assert!(MatrixAdkAgent::starts_with_task_failed_marker(
+            "  [TaskFailed: task-42] delegation loop detected"
+        ));
+    }
+
+    #[test]
+    fn starts_with_task_failed_marker_rejects_later_marker() {
+        assert!(!MatrixAdkAgent::starts_with_task_failed_marker(
+            "Please note [TaskFailed: task-42] delegation loop detected"
+        ));
+    }
+
+    #[test]
+    fn resolve_requester_for_task_map_keeps_original_requester() {
+        let mut task_requesters = HashMap::new();
+
+        let first = MatrixAdkAgent::resolve_requester_for_task_map(
+            &mut task_requesters,
+            "task-2",
+            Some("@alice:matrix.org"),
+            "@alice:matrix.org",
+        );
+        let second = MatrixAdkAgent::resolve_requester_for_task_map(
+            &mut task_requesters,
+            "task-2",
+            None,
+            "@charlie:matrix.org",
+        );
+
+        assert_eq!(first, "@alice:matrix.org");
+        assert_eq!(second, "@alice:matrix.org");
+    }
+
+    #[test]
+    fn resolve_requester_for_task_map_falls_back_to_sender_once() {
+        let mut task_requesters = HashMap::new();
+
+        let requester = MatrixAdkAgent::resolve_requester_for_task_map(
+            &mut task_requesters,
+            "task-7",
+            None,
+            "@bob:matrix.org",
+        );
+
+        assert_eq!(requester, "@bob:matrix.org");
+        assert_eq!(task_requesters.get("task-7"), Some(&"@bob:matrix.org".to_string()));
     }
 }

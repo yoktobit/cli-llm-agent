@@ -1,5 +1,5 @@
 use adk_rust::{
-    SessionId, UserId, futures::StreamExt as _, model::openai::{OpenAIResponsesClient, OpenAIResponsesConfig}, prelude::*, runner::RunnerConfigBuilder, serde_json::json, session::{CreateRequest, GetRequest, SessionService},
+    Tool, Agent, Part, Content, SessionId, UserId, futures::StreamExt as _, model::openai::{OpenAIResponsesClient, OpenAIResponsesConfig}, runner::{RunnerConfigBuilder, Runner}, serde_json::json, session::{CreateRequest, GetRequest, SessionService, InMemorySessionService}, agent::LlmAgentBuilder, tool::FunctionTool,
 };
 
 use anyhow::{Context, Result};
@@ -28,6 +28,10 @@ const COLLABORATION_PROTOCOL: &str = r#"When you receive a chat message, first i
     If you complete the task yourself, include `[TaskComplete: <task_id>]` in your reply. When a requester is provided in the context, also include `[Requester: <requester_user_id>]`.
     
     Do not invent collaborators. Base delegation decisions on known introductions.
+
+    Never, and I mean never, use your own name in your responses or mention yourself. Always refer to yourself as 'I' or 'me'.
+
+    If you ever get the feeling that you are stuck in a loop (e.g. when being asked nearly exactly the same question again or giving the exactly same response) or you are unable to complete the task, respond with `[TaskFailed: <task_id>]` and provide a brief explanation of the issue. And in this case, DO NOT mention anyone, because it would open the loop again.
     "#;
 
 const DEFAULT_INTRODUCTION: &str = "Hello! I am an AI assistant. How can I help you today?";
@@ -38,6 +42,7 @@ pub struct AdkOpenAiAgentConfig {
     system_prompt: Option<String>,
     introductions_file: PathBuf,
     introduction_file: PathBuf,
+    instruction_file: PathBuf,
     open_responses_model: String,
     open_responses_base_url: String,
     openai_api_key: String,
@@ -63,11 +68,19 @@ impl AdkOpenAiAgentConfig {
         let introductions_file = std::env::var("INTRODUCTIONS_FILE")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from(".matrix-store/introductions.json"));
-        let introduction_file = std::env::var("INTRODUCTION_FILE").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("INTRODUCTION.md"));
+        let introduction_file = std::env::var("INTRODUCTION_FILE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("INTRODUCTION.md"));
+        let instruction_file = introduction_file.with_file_name("INSTRUCTION.md");
+        let system_prompt = std::env::var("SYSTEM_PROMPT")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
         Ok(Self {
             introduction: None,
-            introduction_file: introduction_file,
-            system_prompt: None,
+            introduction_file,
+            instruction_file,
+            system_prompt,
             introductions_file,
             open_responses_model: model,
             open_responses_base_url: base_url,
@@ -109,10 +122,7 @@ impl AdkOpenAiAgent {
 
         let client = Arc::new(OpenAIResponsesClient::new(ai_config)?);
         
-        let mut system_prompt = config
-            .system_prompt
-            .clone()
-            .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
+        let mut system_prompt = Self::system_prompt(&config);
 
         system_prompt.push_str("\n\n");
         system_prompt.push_str(COLLABORATION_PROTOCOL);
@@ -269,6 +279,33 @@ impl AdkOpenAiAgent {
             }
         }
         resulting_introduction
+    }
+
+    pub fn system_prompt(config: &AdkOpenAiAgentConfig) -> String {
+        if let Some(system_prompt) = &config.system_prompt {
+            return system_prompt.clone();
+        }
+
+        if config.instruction_file.exists() {
+            let file_system_prompt = match fs::read_to_string(&config.instruction_file) {
+                Ok(file_system_prompt) => file_system_prompt,
+                Err(e) => {
+                    println!("[Error] Error reading instruction file {}", e);
+                    return DEFAULT_SYSTEM_PROMPT.to_string();
+                }
+            };
+
+            if !file_system_prompt.trim().is_empty() {
+                print!(
+                    "Loaded system prompt from {}: {}",
+                    config.instruction_file.display(),
+                    file_system_prompt
+                );
+                return file_system_prompt;
+            }
+        }
+
+        DEFAULT_SYSTEM_PROMPT.to_string()
     }
 
     pub async fn ask(self: &Arc<Self>, room_id: String, task_id: &String, message: String) -> Result<String, anyhow::Error> {
