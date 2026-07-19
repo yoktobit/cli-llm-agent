@@ -17,6 +17,7 @@ pub struct MatrixAdkAgent {
     auto_join: bool,
     task_counter: Arc<AtomicU64>,
     task_requesters: Arc<Mutex<HashMap<String, String>>>,
+    pending_helper_tasks: Arc<Mutex<HashMap<String, PendingHelperTask>>>,
     // TODO: Weitere Handler erlauben
     // join_handlers: Vec<JoinHandler>,
     // message_handlers: Vec<MessageHandler>,
@@ -36,6 +37,7 @@ impl MatrixAdkAgent {
             auto_join: auto_join,
             task_counter: Arc::new(AtomicU64::new(1)),
             task_requesters: Arc::new(Mutex::new(HashMap::new())),
+            pending_helper_tasks: Arc::new(Mutex::new(HashMap::new())),
             // join_handlers: join_handlers,
             // message_handlers: message_handlers,
         };
@@ -69,13 +71,6 @@ impl MatrixAdkAgent {
         self.matrix_agent.clone()
     }
 
-    pub fn add_default_message_handler_for_room(self: &Arc<Self>, room: Room) {
-        let agent: Arc<MatrixAdkAgent> = Arc::clone(self);
-        room.add_event_handler(|event, room| async move {
-            agent.on_room_message(event, room).await;
-        });
-    }
-
     pub fn add_default_message_handler(self: &Arc<Self>) {
         let agent = Arc::clone(self);
         self.matrix_agent
@@ -94,7 +89,6 @@ impl MatrixAdkAgent {
         if room_member.state_key != client.user_id().unwrap() {
             return;
         }
-        let agent = Arc::clone(self);
         tokio::spawn(async move {
             println!("Autojoining room {}", room.room_id());
             let mut delay = 2;
@@ -118,7 +112,6 @@ impl MatrixAdkAgent {
             }
             if delay <= 3600 {
                 println!("Successfully joined room {}", room.room_id());
-                agent.add_default_message_handler_for_room(room);
             }
         });
     }
@@ -167,8 +160,11 @@ impl MatrixAdkAgent {
                     return;
                 }
 
-                let task_context = self.build_task_context(&event.sender.to_string(), room.room_id().to_string(), &message_body);
-                let question = task_context.to_prompt();
+                let sender = event.sender.to_string();
+                let task_context = self.build_task_context(&sender, room.room_id().to_string(), &message_body);
+                let Some(question) = self.build_question_with_helper_barrier(&sender, &task_context) else {
+                    return;
+                };
                 println!("got message and was mentioned, asking llm: {question}");
                 if let Err(_) = room.typing_notice(true).await {}
                 let result_content = self
@@ -182,8 +178,15 @@ impl MatrixAdkAgent {
 
                 if !result_content.trim().is_empty() {
                     let response = Self::parse_agent_response(&result_content);
+                    let effective_task_id = response.effective_task_id(&task_context);
                     let mention_targets = self.resolve_mentions(&response, &task_context, &room).await;
-                    let outgoing_text = self.compose_outgoing_message(response, &task_context);
+                    self.update_pending_helper_task_state(
+                        &effective_task_id,
+                        &task_context.requester,
+                        &response,
+                        &mention_targets,
+                    );
+                    let outgoing_text = self.compose_outgoing_message(&response, &task_context);
                     let (outgoing_text, outgoing_html) =
                         Self::attach_visible_mentions(outgoing_text, &mention_targets);
                     let mentioned_user_ids = mention_targets
@@ -405,14 +408,10 @@ impl MatrixAdkAgent {
         }
     }
 
-    fn compose_outgoing_message(&self, response: AgentResponse, task_context: &TaskContext) -> String {
+    fn compose_outgoing_message(&self, response: &AgentResponse, task_context: &TaskContext) -> String {
         let is_completion = response.is_completion();
-        let mut text = response.text;
-        let effective_task_id = response
-            .task_id
-            .clone()
-            .or(response.completion_task_id.clone())
-            .unwrap_or_else(|| task_context.task_id.clone());
+        let mut text = response.text.clone();
+        let effective_task_id = response.effective_task_id(task_context);
         let should_prefix_task = !response.helper_names.is_empty()
             || response.completion_task_id.is_some()
             || task_context.has_existing_task_id;
@@ -426,6 +425,112 @@ impl MatrixAdkAgent {
         }
 
         text
+    }
+
+    fn build_question_with_helper_barrier(
+        &self,
+        sender: &str,
+        task_context: &TaskContext,
+    ) -> Option<String> {
+        if !task_context.has_existing_task_id {
+            return Some(task_context.to_prompt());
+        }
+
+        let mut pending_helper_tasks = match self.pending_helper_tasks.lock() {
+            Ok(pending_helper_tasks) => pending_helper_tasks,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        let Some(pending_task) = pending_helper_tasks.get_mut(&task_context.task_id) else {
+            return Some(task_context.to_prompt());
+        };
+
+        if !pending_task.expected_helpers.contains(sender) {
+            return Some(task_context.to_prompt());
+        }
+
+        let response_body = task_context.original_message.trim().to_string();
+        if response_body.is_empty() {
+            println!(
+                "helper response for {} from {} is empty, waiting for remaining helpers",
+                task_context.task_id, sender
+            );
+            return None;
+        }
+
+        pending_task
+            .responses
+            .insert(sender.to_string(), response_body);
+
+        let expected = pending_task.expected_helpers.len();
+        let received = pending_task.responses.len();
+        if received < expected {
+            println!(
+                "helper response progress for {}: {received}/{expected}, waiting",
+                task_context.task_id
+            );
+            return None;
+        }
+
+        let mut aggregated_lines = pending_task
+            .responses
+            .iter()
+            .map(|(helper, response)| format!("- {helper}: {response}"))
+            .collect::<Vec<_>>();
+        aggregated_lines.sort();
+
+        let requester = pending_task.requester.clone();
+        pending_helper_tasks.remove(&task_context.task_id);
+
+        println!(
+            "all helper responses received for {} (requester {}), continuing",
+            task_context.task_id, requester
+        );
+
+        let combined_message = format!(
+            "[CollectedHelperResponses]\n{}",
+            aggregated_lines.join("\n")
+        );
+        Some(task_context.to_prompt_with_message(&combined_message))
+    }
+
+    fn update_pending_helper_task_state(
+        &self,
+        task_id: &str,
+        requester: &str,
+        response: &AgentResponse,
+        mention_targets: &[MentionTarget],
+    ) {
+        let expected_helpers = mention_targets
+            .iter()
+            .filter(|target| target.source_tag.is_some())
+            .map(|target| target.user_id.to_string())
+            .collect::<HashSet<_>>();
+
+        let mut pending_helper_tasks = match self.pending_helper_tasks.lock() {
+            Ok(pending_helper_tasks) => pending_helper_tasks,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        if !expected_helpers.is_empty() {
+            let expected_count = expected_helpers.len();
+            pending_helper_tasks.insert(
+                task_id.to_string(),
+                PendingHelperTask {
+                    requester: requester.to_string(),
+                    expected_helpers,
+                    responses: HashMap::new(),
+                },
+            );
+            println!(
+                "tracking helper responses for task {task_id}: expecting {expected_count} helper(s)"
+            );
+            return;
+        }
+
+        if response.is_completion() && pending_helper_tasks.remove(task_id).is_some() {
+            println!("cleared pending helper state for completed task {task_id}");
+        }
     }
 
     async fn resolve_mentions(
@@ -706,6 +811,12 @@ struct MentionTarget {
     source_tag: Option<String>,
 }
 
+struct PendingHelperTask {
+    requester: String,
+    expected_helpers: HashSet<String>,
+    responses: HashMap<String, String>,
+}
+
 struct TaskMetadata {
     task_id: Option<String>,
     requester: Option<String>,
@@ -741,11 +852,15 @@ struct TaskContext {
 }
 
 impl TaskContext {
-    fn to_prompt(&self) -> String {
+    fn to_prompt_with_message(&self, original_message: &str) -> String {
         format!(
             "[TaskContext]\ntask_id: {}\nrequester: {}\nsender: {}\nroom_id: {}\noriginal_message:\n{}",
-            self.task_id, self.requester, self.sender, self.room_id, self.original_message
+            self.task_id, self.requester, self.sender, self.room_id, original_message
         )
+    }
+
+    fn to_prompt(&self) -> String {
+        self.to_prompt_with_message(&self.original_message)
     }
 }
 
@@ -761,12 +876,21 @@ impl AgentResponse {
     fn is_completion(&self) -> bool {
         self.completion_task_id.is_some() || (self.helper_names.is_empty() && !self.text.is_empty())
     }
+
+    fn effective_task_id(&self, task_context: &TaskContext) -> String {
+        self.task_id
+            .clone()
+            .or(self.completion_task_id.clone())
+            .unwrap_or_else(|| task_context.task_id.clone())
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::AgentResponse;
     use super::MatrixAdkAgent;
     use super::MentionTarget;
+    use super::TaskContext;
     use matrix_sdk::ruma::OwnedUserId;
     use std::collections::HashMap;
 
@@ -856,5 +980,65 @@ mod tests {
 
         assert_eq!(requester, "@bob:matrix.org");
         assert_eq!(task_requesters.get("task-7"), Some(&"@bob:matrix.org".to_string()));
+    }
+
+    #[test]
+    fn task_context_to_prompt_with_message_replaces_body() {
+        let context = TaskContext {
+            task_id: "task-11".to_string(),
+            requester: "@requester:example.com".to_string(),
+            sender: "@helper:example.com".to_string(),
+            room_id: "!room:example.com".to_string(),
+            original_message: "old message".to_string(),
+            has_existing_task_id: true,
+        };
+
+        let prompt = context.to_prompt_with_message("[CollectedHelperResponses]\n- @a: done");
+        assert!(prompt.contains("task_id: task-11"));
+        assert!(prompt.contains("requester: @requester:example.com"));
+        assert!(prompt.contains("[CollectedHelperResponses]"));
+        assert!(!prompt.contains("old message"));
+    }
+
+    #[test]
+    fn agent_response_effective_task_id_prefers_explicit_task_marker() {
+        let response = AgentResponse {
+            text: "ok".to_string(),
+            helper_names: Vec::new(),
+            task_id: Some("task-3".to_string()),
+            completion_task_id: Some("task-4".to_string()),
+            requester: None,
+        };
+        let context = TaskContext {
+            task_id: "task-1".to_string(),
+            requester: "@requester:example.com".to_string(),
+            sender: "@sender:example.com".to_string(),
+            room_id: "!room:example.com".to_string(),
+            original_message: "x".to_string(),
+            has_existing_task_id: true,
+        };
+
+        assert_eq!(response.effective_task_id(&context), "task-3");
+    }
+
+    #[test]
+    fn agent_response_effective_task_id_falls_back_to_context_task() {
+        let response = AgentResponse {
+            text: "ok".to_string(),
+            helper_names: Vec::new(),
+            task_id: None,
+            completion_task_id: None,
+            requester: None,
+        };
+        let context = TaskContext {
+            task_id: "task-22".to_string(),
+            requester: "@requester:example.com".to_string(),
+            sender: "@sender:example.com".to_string(),
+            room_id: "!room:example.com".to_string(),
+            original_message: "x".to_string(),
+            has_existing_task_id: false,
+        };
+
+        assert_eq!(response.effective_task_id(&context), "task-22");
     }
 }
