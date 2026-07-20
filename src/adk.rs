@@ -1,11 +1,11 @@
 use adk_rust::{
-    Agent, Content, Part, SessionId, Tool, UserId,
+    AdkIdentity, Agent, AppName, Content, Part, SessionId, Tool, UserId,
     agent::LlmAgentBuilder,
     futures::{Stream, StreamExt as _},
     model::openai::{OpenAIResponsesClient, OpenAIResponsesConfig},
     runner::{Runner, RunnerConfigBuilder},
     serde_json::json,
-    session::{CreateRequest, GetRequest, InMemorySessionService, SessionService},
+    session::{AppendEventRequest, CreateRequest, Event, GetRequest, InMemorySessionService, SessionService},
     tool::FunctionTool,
 };
 
@@ -19,11 +19,12 @@ use std::{
 
 const DEFAULT_INSTRUCTION: &str = "You are a helpful assistant.";
 const APP_NAME: &str = "chatbot";
+const ROOM_CONTEXT_SESSION_ID: &str = "room-context";
 const COLLABORATION_PROTOCOL: &str = r#"When you receive a chat message, first inspect the known participant introductions 
     with the get_known_introductions tool before deciding whether to answer yourself or collaborate. Use those introductions 
     to judge who is best suited for the task.
     
-    If you are asked to introduce yourself, use the introduce_yourself tool and return only its result, nothing more.
+    If you are asked to introduce yourself, use the introduce_yourself tool and return only its result, nothing more. Do not mention anyone then!
     
     You may receive a task context block containing task_id, requester, sender, room_id, and the original message. Keep the task_id stable across 
     all collaboration messages.
@@ -40,6 +41,8 @@ const COLLABORATION_PROTOCOL: &str = r#"When you receive a chat message, first i
     If you ever get the feeling that you are stuck in a loop (e.g. when being asked nearly exactly the same question again or giving the exactly same response) or you are unable to complete the task, respond with `[TaskFailed: <task_id>]` and provide a brief explanation of the issue. And in this case, DO NOT mention anyone, because it would open the loop again.
 
     If you have the feeling that mentioning you in the request message was not on purpose (e.g. you were not meant), then you can ignore the request and respond with a brief explanation. And in this case, DO NOT mention anyone, because it would open a loop again.
+
+    Please answer short and precise, do not use markdown in your answer.
     "#;
 
 const DEFAULT_INTRODUCTION: &str = "Hello! I am an AI assistant. How can I help you today?";
@@ -258,14 +261,21 @@ impl AdkOpenAiAgent {
         matches
     }
 
+    pub fn is_known_helper_user_id(&self, user_id: &str) -> bool {
+        let Ok(introductions) = self.introductions.lock() else {
+            return false;
+        };
+
+        introductions.contains_key(user_id)
+    }
+
     pub async fn ask(
         self: &Arc<Self>,
         room_id: String,
-        task_id: &String,
         message: String,
     ) -> Result<String, anyhow::Error> {
-        let user_id = UserId::new(room_id.clone())?;
-        let session_id = SessionId::new(task_id.clone())?;
+        let user_id = UserId::new(room_id)?;
+        let session_id = SessionId::new(ROOM_CONTEXT_SESSION_ID)?;
 
         // Runner::run expects an existing session; create it once per room if missing.
         self.load_or_create_session(&user_id, &session_id).await?;
@@ -300,6 +310,31 @@ impl AdkOpenAiAgent {
             println!();
         }
         Ok(response_text)
+    }
+
+    pub async fn record_observed_message(
+        self: &Arc<Self>,
+        room_id: String,
+        message: String,
+    ) -> Result<(), anyhow::Error> {
+        let user_id = UserId::new(room_id)?;
+        let session_id = SessionId::new(ROOM_CONTEXT_SESSION_ID)?;
+        self.load_or_create_session(&user_id, &session_id).await?;
+
+        let identity = AdkIdentity::new(
+            AppName::new(APP_NAME)?,
+            user_id,
+            session_id,
+        );
+
+        let mut event = Event::new("matrix-observed-message");
+        event.author = "user".to_string();
+        event.set_content(Content::new("user").with_text(message));
+
+        self.session_service
+            .append_event_for_identity(AppendEventRequest { identity, event })
+            .await?;
+        Ok(())
     }
 
     async fn load_or_create_session(

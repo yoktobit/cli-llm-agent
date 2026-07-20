@@ -5,7 +5,7 @@ use matrix_sdk::ruma::events::SyncMessageLikeEvent;
 use matrix_sdk::ruma::events::room::member::StrippedRoomMemberEvent;
 use matrix_sdk::ruma::events::room::message::{MessageType, RoomMessageEventContent};
 use matrix_sdk::ruma::{OwnedUserId, UserId};
-use matrix_sdk::{Client, Room, RoomState};
+use matrix_sdk::{Client, Room, RoomMemberships, RoomState};
 
 use crate::adk::AdkOpenAiAgent;
 use crate::matrix::MatrixAgent;
@@ -137,8 +137,41 @@ impl MatrixAdkAgent {
                     return;
                 }
 
+                let sender = event.sender.to_string();
+                let room_id = room.room_id().to_string();
+                let own_user_id = room.own_user_id().to_owned();
+                let mut mentioned = false;
+                let mut incoming_mentioned_user_ids: HashSet<OwnedUserId> = HashSet::new();
+                for mention in event.content.mentions.iter() {
+                    if mention.room {
+                        mentioned = true;
+                    }
+                    for mentioned_user_id in &mention.user_ids {
+                        if mentioned_user_id == &own_user_id {
+                            mentioned = true;
+                        } else {
+                            incoming_mentioned_user_ids.insert(mentioned_user_id.clone());
+                        }
+                    }
+                }
+
+                let observed_tag = if mentioned {
+                    "[ObservedMentionedMessage]"
+                } else {
+                    "[ObservedUnmentionedMessage]"
+                };
+                let observed_message = format!(
+                    "{observed_tag}\nSender: {sender}\nRoom: {room_id}\nMessage: {message_body}"
+                );
+                if let Err(err) = self
+                    .adk_agent
+                    .record_observed_message(room_id.clone(), observed_message)
+                    .await
+                {
+                    eprintln!("failed to record observed message: {err}");
+                }
+
                 if let Some(introduction) = Self::extract_introduction(&message_body) {
-                    let sender = event.sender.to_string();
                     if sender != room.own_user_id().to_string() {
                         self.adk_agent
                             .remember_introduction(sender.clone(), introduction.clone());
@@ -146,22 +179,12 @@ impl MatrixAdkAgent {
                     }
                 }
 
-                let mentioned = event.content.mentions.iter().any(|mention| {
-                    if mention.room {
-                        return true;
-                    }
-                    mention
-                        .user_ids
-                        .iter()
-                        .any(|mention| mention == self.matrix_agent.client().user_id().unwrap())
-                });
                 if !mentioned {
-                    println!("got message, but not mentioned");
+                    println!("message recorded to session; not mentioned, skipping response");
                     return;
                 }
 
-                let sender = event.sender.to_string();
-                let task_context = self.build_task_context(&sender, room.room_id().to_string(), &message_body);
+                let task_context = self.build_task_context(&sender, room_id, &message_body);
                 let Some(question) = self.build_question_with_helper_barrier(&sender, &task_context) else {
                     return;
                 };
@@ -169,7 +192,7 @@ impl MatrixAdkAgent {
                 if let Err(_) = room.typing_notice(true).await {}
                 let result_content = self
                     .adk_agent
-                    .ask(room.room_id().into(), &task_context.task_id, question)
+                    .ask(room.room_id().into(), question)
                     .await
                     .unwrap();
                 println!("Result: {result_content}");
@@ -179,7 +202,28 @@ impl MatrixAdkAgent {
                 if !result_content.trim().is_empty() {
                     let response = Self::parse_agent_response(&result_content);
                     let effective_task_id = response.effective_task_id(&task_context);
-                    let mention_targets = self.resolve_mentions(&response, &task_context, &room).await;
+                    let mut mention_targets = self.resolve_mentions(&response, &task_context, &room).await;
+                    for incoming_user_id in incoming_mentioned_user_ids {
+                        if self
+                            .adk_agent
+                            .is_known_helper_user_id(incoming_user_id.as_ref())
+                        {
+                            continue;
+                        }
+                        let mut label = incoming_user_id.to_string();
+                        if let Some(room_label) =
+                            Self::lookup_room_label(&room, incoming_user_id.as_ref()).await
+                        {
+                            label = room_label;
+                        }
+                        mention_targets.push(MentionTarget {
+                            user_id: incoming_user_id,
+                            label,
+                            source_tag: None,
+                        });
+                    }
+                    mention_targets.sort_by(|left, right| left.user_id.cmp(&right.user_id));
+                    mention_targets.dedup_by(|left, right| left.user_id == right.user_id);
                     self.update_pending_helper_task_state(
                         &effective_task_id,
                         &task_context.requester,
@@ -540,20 +584,29 @@ impl MatrixAdkAgent {
         room: &Room,
     ) -> Vec<MentionTarget> {
         let mut mentions = self.resolve_user_mentions(&response.helper_names);
+        mentions.extend(
+            self.resolve_user_mentions_from_room_labels(room, &response.helper_names, &mentions)
+                .await,
+        );
 
         if response.is_completion() {
             let requester = response
                 .requester
                 .as_deref()
                 .unwrap_or(&task_context.requester);
-            if let Ok(user_id) = UserId::parse(requester) {
+            let requester_user_id = UserId::parse(requester)
+                .or_else(|_| UserId::parse(task_context.requester.as_str()));
+            if let Ok(user_id) = requester_user_id {
                 mentions.push(MentionTarget {
                     label: user_id.to_string(),
                     user_id,
                     source_tag: None,
                 });
             } else {
-                eprintln!("Skipping invalid requester user id '{requester}'");
+                eprintln!(
+                    "Skipping invalid requester user id '{}' and fallback '{}'",
+                    requester, task_context.requester
+                );
             }
         }
 
@@ -566,6 +619,66 @@ impl MatrixAdkAgent {
             }
         }
 
+        mentions
+    }
+
+    async fn resolve_user_mentions_from_room_labels(
+        &self,
+        room: &Room,
+        helper_names: &[String],
+        existing_mentions: &[MentionTarget],
+    ) -> Vec<MentionTarget> {
+        let unresolved_helper_names = helper_names
+            .iter()
+            .filter(|helper_name| {
+                !existing_mentions.iter().any(|mention| {
+                    mention.source_tag.as_deref() == Some(helper_name.as_str())
+                })
+            })
+            .collect::<Vec<_>>();
+        if unresolved_helper_names.is_empty() {
+            return Vec::new();
+        }
+
+        let members = match room.members(RoomMemberships::ACTIVE).await {
+            Ok(members) => members,
+            Err(err) => {
+                eprintln!("failed to list room members for mention resolution: {err}");
+                return Vec::new();
+            }
+        };
+
+        let mut mentions = Vec::new();
+        for helper_name in unresolved_helper_names {
+            let helper_label = helper_name.trim();
+            if helper_label.is_empty() {
+                continue;
+            }
+            let helper_label_lower = helper_label.to_lowercase();
+
+            for member in &members {
+                let display_name = member
+                    .display_name()
+                    .map(str::trim)
+                    .filter(|display_name| !display_name.is_empty())
+                    .unwrap_or_else(|| member.user_id().as_str());
+                let display_name_lower = display_name.to_lowercase();
+                if display_name_lower != helper_label_lower
+                    && !display_name_lower.contains(&helper_label_lower)
+                {
+                    continue;
+                }
+
+                mentions.push(MentionTarget {
+                    user_id: member.user_id().to_owned(),
+                    label: display_name.to_string(),
+                    source_tag: Some(helper_name.clone()),
+                });
+            }
+        }
+
+        mentions.sort_by(|left, right| left.user_id.cmp(&right.user_id));
+        mentions.dedup_by(|left, right| left.user_id == right.user_id);
         mentions
     }
 
@@ -602,16 +715,36 @@ impl MatrixAdkAgent {
         let mut mentions = Vec::new();
 
         for helper_name in helper_names {
+            let mut resolved_any = false;
             for user_id in self.adk_agent.find_helper_user_ids_by_name(helper_name) {
                 match UserId::parse(user_id.clone()) {
-                    Ok(owned) => mentions.push(MentionTarget {
-                        label: helper_name.clone(),
-                        user_id: owned,
-                        source_tag: Some(helper_name.clone()),
-                    }),
+                    Ok(owned) => {
+                        mentions.push(MentionTarget {
+                            label: helper_name.clone(),
+                            user_id: owned,
+                            source_tag: Some(helper_name.clone()),
+                        });
+                        resolved_any = true;
+                    }
                     Err(_) => {
                         eprintln!("Skipping invalid helper user id '{user_id}' for '{helper_name}'");
                     }
+                }
+            }
+
+            if !resolved_any {
+                let direct_user_id = if helper_name.starts_with('@') {
+                    helper_name.clone()
+                } else {
+                    format!("@{helper_name}")
+                };
+
+                if let Ok(owned) = UserId::parse(direct_user_id) {
+                    mentions.push(MentionTarget {
+                        label: helper_name.clone(),
+                        user_id: owned,
+                        source_tag: Some(helper_name.clone()),
+                    });
                 }
             }
         }
